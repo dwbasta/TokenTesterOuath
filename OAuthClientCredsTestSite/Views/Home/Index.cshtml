@@ -1,0 +1,67 @@
+@model TestPageViewModel
+
+<h1>OAuth 2.0 Client Credentials Test</h1>
+<p class="muted">
+    For Microsoft Entra app-to-app testing using application permissions.
+</p>
+
+<form asp-action="Index" method="post">
+    <div class="field">
+        <label asp-for="Request.TenantId"></label>
+        <input asp-for="Request.TenantId" />
+        <span asp-validation-for="Request.TenantId" class="err"></span>
+    </div>
+
+    <div class="field">
+        <label asp-for="Request.ClientId"></label>
+        <input asp-for="Request.ClientId" />
+        <span asp-validation-for="Request.ClientId" class="err"></span>
+    </div>
+
+    <div class="field">
+        <label asp-for="Request.ClientSecret"></label>
+        <input asp-for="Request.ClientSecret" type="password" />
+        <span asp-validation-for="Request.ClientSecret" class="err"></span>
+    </div>
+
+    <div class="field">
+        <label asp-for="Request.Scope"></label>
+        <input asp-for="Request.Scope" />
+        <span asp-validation-for="Request.Scope" class="err"></span>
+    </div>
+
+    <div class="field">
+        <label asp-for="Request.ApiUrl"></label>
+        <input asp-for="Request.ApiUrl" placeholder="https://localhost:5001/api/test" />
+        <span asp-validation-for="Request.ApiUrl" class="err"></span>
+    </div>
+
+    <button type="submit">Acquire token and test API</button>
+</form>
+
+@if (Model.HasResult)
+{
+    <div class="card">
+        @if (Model.IsSuccess && Model.Token is not null)
+        {
+            <p class="ok"><strong>Success:</strong> access token acquired.</p>
+            <p><strong>Token Type:</strong> @Model.Token.TokenType</p>
+            <p><strong>Expires In:</strong> @Model.Token.ExpiresIn seconds</p>
+            <details>
+                <summary><strong>Access Token</strong></summary>
+                <pre>@Model.Token.AccessToken</pre>
+            </details>
+
+            @if (!string.IsNullOrWhiteSpace(Model.ApiStatusCode))
+            {
+                <h3>Downstream API Result</h3>
+                <p><strong>Status Code:</strong> @Model.ApiStatusCode</p>
+                <pre>@Model.ApiResponseBody</pre>
+            }
+        }
+        else
+        {
+            <p class="err"><strong>Failure:</strong> @Model.Error</p>
+        }
+    </div>
+}

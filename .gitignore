@@ -1,0 +1,35 @@
+# Build directories
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.sln.docstates
+*.user
+*.suo
+*.userosscache
+*.sln.iml
+
+# User-specific files
+*.rsuser
+
+# Output
+*.exe
+*.dll
+*.pdb
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.swp
+*.swo

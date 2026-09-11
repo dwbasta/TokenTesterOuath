@@ -1,0 +1,7 @@
+{
+  "Jwt": {
+    "Authority": "",
+    "Audiences": [],
+    "RequiredScope": "access_as_user"
+  }
+}

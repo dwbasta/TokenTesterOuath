@@ -209,3 +209,140 @@ The endpoint data is fictional demonstration data. Do not use the sample salary,
 - **The browser redirects but cannot connect:** Configure the IIS HTTPS binding and certificate.
 - **The API returns 401:** Check the tenant, authority, audience, token issuer, and token expiration.
 - **The API returns 403:** Confirm that the calling client has the protected API's `Api.Read` application permission and administrator consent.
+
+## 7. Deploy and configure MCP with OBO for Copilot Studio
+
+This section configures `OUathMCPServer` as an MCP endpoint that performs OBO token exchange to call the downstream protected API.
+
+### 7.1 Publish both applications
+
+Run from repository root:
+
+```powershell
+cd C:\Users\dylanbasta\source\repos\dwbasta\TokenTesterOuath
+
+$publishRoot = "C:\temp\publish"
+$webOut = Join-Path $publishRoot "OAuthClientCredsTestSite"
+$mcpOut = Join-Path $publishRoot "OUathMCPServer"
+
+New-Item -ItemType Directory -Path $webOut -Force | Out-Null
+New-Item -ItemType Directory -Path $mOut -Force | Out-Null
+
+dotnet restore .\OAuthClientCredsTestSite\OAuthClientCredsTestSite.csproj
+dotnet restore .\OUathMCPServer\OUathMCPServer.csproj
+
+dotnet build .\OAuthClientCredsTestSite\OAuthClientCredsTestSite.csproj -c Release
+dotnet build .\OUathMCPServer\OUathMCPServer.csproj -c Release
+
+dotnet publish .\OAuthClientCredsTestSite\OAuthClientCredsTestSite.csproj -c Release -o $webOut
+dotnet publish .\OUathMCPServer\OUathMCPServer.csproj -c Release -o $mcpOut
+```
+
+Deploy `C:\temp\publish\OUathMCPServer` to the IIS site path for the MCP app.
+
+### 7.2 Required MCP configuration files
+
+`OUathMCPServer\jwtsettings.json`:
+
+```json
+{
+  "Jwt": {
+    "Authority": "https://login.microsoftonline.com/<tenant-id>/v2.0",
+    "Audiences": [
+      "api://8ac01e5d-5520-4952-b84c-5eecf1fece25"
+    ],
+    "RequiredScope": "access_as_user"
+  }
+}
+```
+
+`OUathMCPServer\obosettings.json`:
+
+```json
+{
+  "Obo": {
+    "ClientId": "<mcp-server-app-id>",
+    "ClientSecret": "<mcp-server-app-secret>",
+    "DownstreamApiBaseUrl": "https://ResurgemusTokenTest.resurgemus.xyz",
+    "DownstreamScope": "api://404be116-6db5-481a-9974-56709134adb5/Competitor.Read"
+  }
+}
+```
+
+### 7.3 MCP endpoints expected by Copilot Studio
+
+The MCP app should expose:
+
+- `GET /.well-known/mcp`
+- `POST /mcp`
+- `GET /.well-known/oauth-protected-resource`
+- `GET /.well-known/oauth-protected-resource/mcp`
+- `GET /.well-known/oauth-authorization-server`
+- `GET /.well-known/oauth-authorization-server/mcp`
+- `GET /.well-known/openid-configuration`
+- `GET /.well-known/openid-configuration/mcp`
+
+### 7.4 Copilot Studio MCP setup (Manual OAuth)
+
+Use **Manual** MCP configuration and these values:
+
+- Server URL: `https://mcptokentest.resurgemus.xyz/mcp`
+- Client ID: `52b8b893-bed0-4b14-91d0-39349f574f5d`
+- Client secret: connector client app secret value
+- Authorization URL: `https://login.microsoftonline.com/e0e1f74a-a300-42c6-a65c-917c4befb560/oauth2/v2.0/authorize`
+- Token URL: `https://login.microsoftonline.com/e0e1f74a-a300-42c6-a65c-917c4befb560/oauth2/v2.0/token`
+- Refresh token URL: `https://login.microsoftonline.com/e0e1f74a-a300-42c6-a65c-917c4befb560/oauth2/v2.0/token`
+- Scope: `api://8ac01e5d-5520-4952-b84c-5eecf1fece25/access_as_user openid profile offline_access`
+
+Required app registration configuration for client app `52b8b893-bed0-4b14-91d0-39349f574f5d`:
+
+- Add the Copilot/APIM redirect URI shown during sign-in (for example `https://global.consent.azure-apim.net/redirect/...`).
+- Add delegated permission to MCP API scope `access_as_user`.
+- Grant admin/user consent.
+
+### 7.5 Validation commands
+
+```powershell
+Invoke-RestMethod https://mcptokentest.resurgemus.xyz/api/status
+Invoke-RestMethod https://mcptokentest.resurgemus.xyz/.well-known/mcp
+Invoke-RestMethod https://mcptokentest.resurgemus.xyz/.well-known/oauth-protected-resource
+Invoke-RestMethod https://mcptokentest.resurgemus.xyz/.well-known/oauth-authorization-server
+Invoke-RestMethod https://mcptokentest.resurgemus.xyz/.well-known/openid-configuration
+Invoke-RestMethod https://mcptokentest.resurgemus.xyz/.well-known/oauth-protected-resource/mcp
+Invoke-RestMethod https://mcptokentest.resurgemus.xyz/.well-known/oauth-authorization-server/mcp
+Invoke-RestMethod https://mcptokentest.resurgemus.xyz/.well-known/openid-configuration/mcp
+Invoke-RestMethod -Method Post https://mcptokentest.resurgemus.xyz/mcp -ContentType "application/json" -Body '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+Invoke-RestMethod -Method Post https://mcptokentest.resurgemus.xyz/mcp -ContentType "application/json" -Body '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
+
+### 7.6 Common MCP/OAuth failures
+
+- **Could not discover authorization server metadata**: discovery/OAuth metadata endpoints missing or returning non-`200`.
+- **GetDynamicClientRegistrationResultAsync failed (NotFound)**: dynamic client registration is not available; use Manual OAuth setup.
+- **AADSTS50011 redirect URI mismatch**: add the exact redirect URI used by Copilot/APIM to the client app registration.
+- **AADSTS7000218 invalid_client**: wrong client type/credentials or missing secret for confidential flow.
+- **MCP tool load failure with 403**: token audience/scope mismatch (`aud` must be MCP API audience; `scp` must include `access_as_user`).
+- **Tool runtime failure**: verify `Obo:DownstreamApiBaseUrl` DNS resolution and downstream API availability.
+
+### 7.7 IIS log and event log checks
+
+For recent MCP failures:
+
+```powershell
+Get-ChildItem "C:\inetpub\logs\LogFiles" -Recurse -File |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 3 FullName, LastWriteTime
+
+Get-WinEvent -FilterHashtable @{
+  LogName = "Application"
+  StartTime = (Get-Date).AddMinutes(-30)
+} | Where-Object {
+  $_.ProviderName -match "IIS|ASP.NET|.NET Runtime|IIS AspNetCore Module V2"
+} | Select-Object TimeCreated, ProviderName, LevelDisplayName, Id, Message -First 80
+```
+
+## Security notes
+
+- Never commit real client secrets or refresh tokens to source control.
+- Rotate any secret/token that has been exposed in terminal history or logs.
+- Prefer environment variables or secure secret stores for production deployments.

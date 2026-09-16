@@ -33,3 +33,7 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+scripts/call-protected-api - Copy.ps1
+
+scripts/testmcp.ps1

@@ -309,7 +309,7 @@ Configure `OUathMCPServer\jwtsettings.json`:
 }
 
 ## 13. MCP OBO configuration (`OUathMCPServer/obosettings.json`)
- 
+
 {
   "Obo": {
     "ClientId": "<mcp-server-client-app-id>",
@@ -367,6 +367,25 @@ Invoke-RestMethod -Method Get -Uri $apiUrl -Headers @{ Authorization = "Bearer $
 
 Required permission assignment: the calling client app must be assigned protected API **application roles** (for example `Api.Read`) and admin consent must be granted.
 
+### Flow Diagrams
+
+To better understand the interactions between components, refer to the following flow diagrams:
+
+#### Client Credentials Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client as Calling Client App
+    participant Entra as Microsoft Entra ID
+    participant API as Protected API
+
+    Client->>Entra: POST /token (client_credentials, scope=api://<protected-api-app-id>/.default)
+    Entra-->>Client: Access token (app-only)
+    Client->>API: GET /api/data with Bearer token
+    API-->>Client: 200 OK (if app role like Api.Read is assigned)
+```
+
 ## 16. Exercise 2: Delegated MCP flow example (Copilot -> MCP -> API via OBO)
 
 Use this flow when user context must be preserved.
@@ -389,7 +408,32 @@ In `OUathMCPServer\obosettings.json`:
   }
 }
 
+### Flow Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as User in Copilot
+    participant Copilot as Copilot Client/Agent
+    participant Entra as Microsoft Entra ID
+    participant MCP as MCP Server
+    participant API as Protected API
+
+    User->>Copilot: Sign in
+    Copilot->>Entra: Request delegated token for api://<mcp-api-app-id>/access_as_user
+    Entra-->>Copilot: Access token (delegated)
+    Copilot->>MCP: POST /mcp with Bearer token
+    MCP->>MCP: Validate aud + scp=access_as_user
+    MCP->>Entra: OBO token request for api://<protected-api-app-id>/<delegated-scope>
+    Entra-->>MCP: Downstream delegated token
+    MCP->>API: Call protected endpoint with downstream token
+    API-->>MCP: Protected data response
+    MCP-->>Copilot: MCP tool/result response
+```
+
 ## 17. Entra app permission wiring (MCP + Protected API)
+
+Use this section for app permission setup, and use "MCP runtime token validation" wording for runtime checks.
 
 Use the following permission model for this solution:
 

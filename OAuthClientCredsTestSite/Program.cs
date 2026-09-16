@@ -20,16 +20,12 @@ var authority = builder.Configuration["Jwt:Authority"];
 var apiDisplayName = builder.Configuration["Api:DisplayName"] ?? "Token API";
 
 var defaultReadRole = builder.Configuration["Jwt:RequiredRole"] ?? "Api.Read";
-var defaultReadScope = builder.Configuration["Jwt:RequiredScope"] ?? "Api.Read";
 var writeRole = builder.Configuration["Jwt:RequiredWriteRole"] ?? "Api.Write";
-var writeScope = builder.Configuration["Jwt:RequiredWriteScope"] ?? "Api.Write";
 
-// Validate required JWT configuration
 if (string.IsNullOrWhiteSpace(authority) || validAudiences.Length == 0)
 {
     throw new InvalidOperationException(
-        "JWT configuration is incomplete. Ensure jwtsettings.json is configured with Jwt:Authority and Jwt:Audiences, " +
-        "or run the deployment script to populate these values at deploy time.");
+        "JWT configuration is incomplete. Ensure jwtsettings.json is configured with Jwt:Authority and Jwt:Audiences.");
 }
 
 if (!Uri.TryCreate(authority, UriKind.Absolute, out var authorityUri))
@@ -40,6 +36,7 @@ if (!Uri.TryCreate(authority, UriKind.Absolute, out var authorityUri))
 var authorityPathSegments = authorityUri.AbsolutePath
     .Trim('/')
     .Split('/', StringSplitOptions.RemoveEmptyEntries);
+
 if (authorityPathSegments.Length == 0)
 {
     throw new InvalidOperationException("Jwt:Authority must include a tenant segment.");
@@ -87,11 +84,9 @@ builder.Services
                     .GetRequiredService<ILoggerFactory>()
                     .CreateLogger("JwtAuthorization");
                 var roles = context.HttpContext.User.FindAll("roles").Select(claim => claim.Value).ToArray();
-                var scopes = context.HttpContext.User.FindAll("scp").Select(claim => claim.Value).ToArray();
-                logger.LogWarning("Authorization denied for {Path}. Roles: {Roles}. Scopes: {Scopes}.",
+                logger.LogWarning("Authorization denied for {Path}. Roles: {Roles}.",
                     context.HttpContext.Request.Path,
-                    roles.Length == 0 ? "<none>" : string.Join(", ", roles),
-                    scopes.Length == 0 ? "<none>" : string.Join(", ", scopes));
+                    roles.Length == 0 ? "<none>" : string.Join(", ", roles));
                 return Task.CompletedTask;
             }
         };
@@ -99,20 +94,9 @@ builder.Services
 
 builder.Services.AddAuthorization(options =>
 {
-    static bool HasRoleOrScope(ClaimsPrincipal user, string requiredRole, string requiredScope)
-    {
-        var hasRole = user.FindAll("roles")
+    static bool HasRole(ClaimsPrincipal user, string requiredRole) =>
+        user.FindAll("roles")
             .Any(claim => string.Equals(claim.Value, requiredRole, StringComparison.OrdinalIgnoreCase));
-        if (hasRole)
-        {
-            return true;
-        }
-
-        var scopes = user.FindAll("scp")
-            .SelectMany(claim => claim.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries));
-
-        return scopes.Contains(requiredScope, StringComparer.OrdinalIgnoreCase);
-    }
 
     static string GetPath(AuthorizationHandlerContext context)
     {
@@ -131,20 +115,20 @@ builder.Services.AddAuthorization(options =>
 
     var endpointRequirements = new[]
     {
-        new { Prefix = "/api/data/competitors", Role = "Competitor.Reader", Scope = "Competitor.Read" },
-        new { Prefix = "/api/data/recipes", Role = "Recipe.Reader", Scope = "Recipe.Read" },
-        new { Prefix = "/api/data/recipies", Role = "Recipe.Reader", Scope = "Recipe.Read" },
-        new { Prefix = "/api/data/employees", Role = "Employee.Reader", Scope = "Employee.Read" },
-        new { Prefix = "/api/data/inventory", Role = "Inventory.Reader", Scope = "Inventory.Read" },
-        new { Prefix = "/api/data/sales", Role = "Sales.Reader", Scope = "Sales.Read" },
-        new { Prefix = "/api/data/customers", Role = "Customer.Reader", Scope = "Customer.Read" },
-        new { Prefix = "/api/data/locations", Role = "Location.Reader", Scope = "Location.Read" },
-        new { Prefix = "/api/data/reviews", Role = "Review.Reader", Scope = "Review.Read" },
-        new { Prefix = "/api/data/inspections", Role = "Inspection.Reader", Scope = "Inspection.Read" },
-        new { Prefix = "/api/data/employee-of-the-month", Role = "Employee.Reader", Scope = "Employee.Read" },
-        new { Prefix = "/api/data/secret-formula/status", Role = "SecretFormula.Reader", Scope = "SecretFormula.Read" },
-        new { Prefix = "/api/data/underwater-weather", Role = "Weather.Reader", Scope = "Weather.Read" },
-        new { Prefix = "/api/data/health/ingredients", Role = "IngredientHealth.Reader", Scope = "IngredientHealth.Read" }
+        new { Prefix = "/api/data/competitors", Role = "Competitor.Reader" },
+        new { Prefix = "/api/data/recipes", Role = "Recipe.Reader" },
+        new { Prefix = "/api/data/recipies", Role = "Recipe.Reader" },
+        new { Prefix = "/api/data/employees", Role = "Employee.Reader" },
+        new { Prefix = "/api/data/inventory", Role = "Inventory.Reader" },
+        new { Prefix = "/api/data/sales", Role = "Sales.Reader" },
+        new { Prefix = "/api/data/customers", Role = "Customer.Reader" },
+        new { Prefix = "/api/data/locations", Role = "Location.Reader" },
+        new { Prefix = "/api/data/reviews", Role = "Review.Reader" },
+        new { Prefix = "/api/data/inspections", Role = "Inspection.Reader" },
+        new { Prefix = "/api/data/employee-of-the-month", Role = "Employee.Reader" },
+        new { Prefix = "/api/data/secret-formula/status", Role = "SecretFormula.Reader" },
+        new { Prefix = "/api/data/underwater-weather", Role = "Weather.Reader" },
+        new { Prefix = "/api/data/health/ingredients", Role = "IngredientHealth.Reader" }
     };
 
     options.AddPolicy("ApiRead", policy =>
@@ -152,30 +136,23 @@ builder.Services.AddAuthorization(options =>
         policy.RequireAuthenticatedUser();
         policy.RequireAssertion(context =>
         {
-            // Backward compatibility: keep global Api.Read / Api.Read scope access working
-            if (HasRoleOrScope(context.User, defaultReadRole, defaultReadScope))
-            {
-                return true;
-            }
-
-            // Optional finer-grained roles/scopes by endpoint
             var path = GetPath(context);
             var requirement = endpointRequirements.FirstOrDefault(item =>
                 path.StartsWith(item.Prefix, StringComparison.OrdinalIgnoreCase));
 
             if (requirement is null)
             {
-                return false;
+                return HasRole(context.User, defaultReadRole);
             }
 
-            return HasRoleOrScope(context.User, requirement.Role, requirement.Scope);
+            return HasRole(context.User, requirement.Role);
         });
     });
 
     options.AddPolicy("ApiWrite", policy =>
     {
         policy.RequireAuthenticatedUser();
-        policy.RequireAssertion(context => HasRoleOrScope(context.User, writeRole, writeScope));
+        policy.RequireAssertion(context => HasRole(context.User, writeRole));
     });
 });
 
@@ -192,6 +169,39 @@ app.UseRouting();
 
 app.UseAuthentication();
 app.UseAuthorization();
+
+app.Use(async (context, next) =>
+{
+    await next();
+
+    if (!context.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase))
+    {
+        return;
+    }
+
+    if (context.Response.HasStarted)
+    {
+        return;
+    }
+
+    if (context.Response.StatusCode is StatusCodes.Status401Unauthorized or StatusCodes.Status403Forbidden)
+    {
+        context.Response.ContentType = "application/problem+json";
+
+        var problem = new
+        {
+            type = "https://httpstatuses.com/" + context.Response.StatusCode,
+            title = context.Response.StatusCode == StatusCodes.Status401Unauthorized ? "Unauthorized" : "Forbidden",
+            status = context.Response.StatusCode,
+            traceId = context.TraceIdentifier,
+            detail = context.Response.StatusCode == StatusCodes.Status401Unauthorized
+                ? "Token validation failed or token was not provided."
+                : "Token is valid, but required role/scope for this endpoint is missing."
+        };
+
+        await context.Response.WriteAsJsonAsync(problem);
+    }
+});
 
 app.MapControllers();
 app.MapGet("/", () => Results.Redirect("/index.html"));

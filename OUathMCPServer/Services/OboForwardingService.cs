@@ -1,4 +1,4 @@
-using System.Net.Http.Headers;
+﻿using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using OUathMCPServer.Models;
@@ -19,7 +19,8 @@ public sealed class OboForwardingService(
         var clientId = configuration["Obo:ClientId"];
         var clientSecret = configuration["Obo:ClientSecret"];
         var downstreamBaseUrl = configuration["Obo:DownstreamApiBaseUrl"];
-        var downstreamScope = request.Scope ?? configuration["Obo:DownstreamScope"];
+        var downstreamScope = configuration["Obo:DownstreamScope"];
+        var configuredDownstreamAudience = configuration["Obo:DownstreamAudience"];
 
         if (string.IsNullOrWhiteSpace(authority) ||
             string.IsNullOrWhiteSpace(clientId) ||
@@ -51,10 +52,7 @@ public sealed class OboForwardingService(
             throw new InvalidOperationException("Obo:DownstreamApiBaseUrl must be a valid absolute URI.");
         }
 
-        if (Uri.TryCreate(request.Path, UriKind.Absolute, out _))
-        {
-            throw new InvalidOperationException("Path must be relative.");
-        }
+        ValidateRelativePath(request.Path);
 
         var tokenEndpoint = $"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token";
         using var tokenRequest = new HttpRequestMessage(HttpMethod.Post, tokenEndpoint)
@@ -90,6 +88,12 @@ public sealed class OboForwardingService(
             throw new InvalidOperationException("OBO token response contained an empty access token.");
         }
 
+        ValidateTokenCorrelation(
+            userAccessToken,
+            accessToken,
+            downstreamScope,
+            configuredDownstreamAudience);
+
         var method = ParseMethod(request.Method);
         var downstreamUri = new Uri(baseUri, request.Path);
         using var downstreamRequest = new HttpRequestMessage(method, downstreamUri);
@@ -119,7 +123,169 @@ public sealed class OboForwardingService(
         var responseBody = await downstreamResponse.Content.ReadAsStringAsync(cancellationToken);
         var contentType = downstreamResponse.Content.Headers.ContentType?.ToString() ?? "application/json";
 
+        if (downstreamResponse.StatusCode >= System.Net.HttpStatusCode.BadRequest &&
+            string.IsNullOrWhiteSpace(responseBody))
+        {
+            responseBody = JsonSerializer.Serialize(new
+            {
+                error = "downstream_request_failed",
+                statusCode = (int)downstreamResponse.StatusCode,
+                method = method.Method,
+                path = request.Path,
+                detail = "Downstream API returned an error with an empty response body."
+            });
+            contentType = "application/json";
+        }
+
         return new OboForwardResult((int)downstreamResponse.StatusCode, contentType, responseBody);
+    }
+
+    private static void ValidateRelativePath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            throw new InvalidOperationException("Path is required.");
+        }
+
+        if (Uri.TryCreate(path, UriKind.Absolute, out _))
+        {
+            throw new InvalidOperationException("Path must be relative.");
+        }
+
+        if (!path.StartsWith('/'))
+        {
+            throw new InvalidOperationException("Path must start with '/'.");
+        }
+
+        if (path.StartsWith("//", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Path cannot start with '//'.");
+        }
+
+        if (path.Contains('\\'))
+        {
+            throw new InvalidOperationException("Path cannot contain backslashes.");
+        }
+    }
+
+    private static void ValidateTokenCorrelation(
+        string incomingUserToken,
+        string downstreamAccessToken,
+        string downstreamScope,
+        string? configuredDownstreamAudience)
+    {
+        var incomingClaims = ParseJwtPayload(incomingUserToken);
+        var downstreamClaims = ParseJwtPayload(downstreamAccessToken);
+
+        var incomingTid = TryGetClaim(incomingClaims, "tid");
+        var downstreamTid = TryGetClaim(downstreamClaims, "tid");
+        if (!string.IsNullOrWhiteSpace(incomingTid) &&
+            !string.IsNullOrWhiteSpace(downstreamTid) &&
+            !string.Equals(incomingTid, downstreamTid, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new UnauthorizedAccessException("Tenant correlation failed between incoming token and downstream OBO token.");
+        }
+
+        var incomingOid = TryGetClaim(incomingClaims, "oid");
+        var downstreamOid = TryGetClaim(downstreamClaims, "oid");
+        if (!string.IsNullOrWhiteSpace(incomingOid) &&
+            !string.IsNullOrWhiteSpace(downstreamOid) &&
+            !string.Equals(incomingOid, downstreamOid, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new UnauthorizedAccessException("User correlation failed between incoming token and downstream OBO token.");
+        }
+
+        var expectedAudience = ResolveExpectedDownstreamAudience(downstreamScope, configuredDownstreamAudience);
+        var actualAudience = TryGetClaim(downstreamClaims, "aud");
+        if (!string.IsNullOrWhiteSpace(expectedAudience) &&
+            !string.IsNullOrWhiteSpace(actualAudience) &&
+            !string.Equals(expectedAudience, actualAudience, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new UnauthorizedAccessException("Downstream OBO token audience does not match configured target resource.");
+        }
+
+        var expectedScopeName = ResolveExpectedScopeName(downstreamScope);
+        var actualScopes = TryGetClaim(downstreamClaims, "scp");
+        if (!string.IsNullOrWhiteSpace(expectedScopeName) &&
+            !string.Equals(expectedScopeName, ".default", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(actualScopes))
+        {
+            var scopeList = actualScopes.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (!scopeList.Contains(expectedScopeName, StringComparer.OrdinalIgnoreCase))
+            {
+                throw new UnauthorizedAccessException("Downstream OBO token does not contain expected delegated scope.");
+            }
+        }
+    }
+
+    private static string ResolveExpectedDownstreamAudience(string scope, string? configuredAudience)
+    {
+        if (!string.IsNullOrWhiteSpace(configuredAudience))
+        {
+            return configuredAudience;
+        }
+
+        var separatorIndex = scope.LastIndexOf('/');
+        if (separatorIndex <= 0)
+        {
+            return scope;
+        }
+
+        return scope[..separatorIndex];
+    }
+
+    private static string ResolveExpectedScopeName(string scope)
+    {
+        var separatorIndex = scope.LastIndexOf('/');
+        if (separatorIndex < 0 || separatorIndex == scope.Length - 1)
+        {
+            return string.Empty;
+        }
+
+        return scope[(separatorIndex + 1)..];
+    }
+
+    private static Dictionary<string, string> ParseJwtPayload(string jwt)
+    {
+        var parts = jwt.Split('.');
+        if (parts.Length < 2)
+        {
+            throw new InvalidOperationException("Token format is invalid.");
+        }
+
+        var payloadBytes = Base64UrlDecode(parts[1]);
+        using var payloadJson = JsonDocument.Parse(payloadBytes);
+
+        var claims = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var property in payloadJson.RootElement.EnumerateObject())
+        {
+            claims[property.Name] = property.Value.ValueKind switch
+            {
+                JsonValueKind.String => property.Value.GetString() ?? string.Empty,
+                _ => property.Value.GetRawText()
+            };
+        }
+
+        return claims;
+    }
+
+    private static string TryGetClaim(Dictionary<string, string> claims, string claimType) =>
+        claims.TryGetValue(claimType, out var value) ? value : string.Empty;
+
+    private static byte[] Base64UrlDecode(string input)
+    {
+        var normalized = input.Replace('-', '+').Replace('_', '/');
+        switch (normalized.Length % 4)
+        {
+            case 2:
+                normalized += "==";
+                break;
+            case 3:
+                normalized += "=";
+                break;
+        }
+
+        return Convert.FromBase64String(normalized);
     }
 
     private static HttpMethod ParseMethod(string method) => method.Trim().ToUpperInvariant() switch
@@ -135,3 +301,4 @@ public sealed class OboForwardingService(
     private static bool AllowsBody(HttpMethod method) =>
         method == HttpMethod.Post || method == HttpMethod.Put || method == HttpMethod.Patch;
 }
+

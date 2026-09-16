@@ -3,6 +3,7 @@
     "ClientId": "",
     "ClientSecret": "",
     "DownstreamApiBaseUrl": "",
-    "DownstreamScope": ""
+    "DownstreamScope": "",
+    "DownstreamAudience": ""
   }
 }

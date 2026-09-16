@@ -1,7 +1,10 @@
 {
   "Jwt": {
-    "Authority": "",
-    "Audiences": [],
+    "Authority": "https://login.microsoftonline.com/<tenant-id>/v2.0",
+    "Audiences": [
+      "api://8ac01e5d-5520-4952-b84c-5eecf1fece25"
+    ],
+    "RequiredRole": "Mcp.Invoke",
     "RequiredScope": "access_as_user"
   }
 }

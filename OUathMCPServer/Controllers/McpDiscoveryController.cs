@@ -10,6 +10,7 @@ namespace OUathMCPServer.Controllers;
 [ApiController]
 public sealed class McpDiscoveryController(
     IConfiguration configuration,
+    IAuthorizationService authorizationService,
     OboForwardingService oboForwardingService,
     ILogger<McpDiscoveryController> logger) : ControllerBase
 {
@@ -116,8 +117,7 @@ public sealed class McpDiscoveryController(
                                     path = new { type = "string" },
                                     method = new { type = "string", @enum = new[] { "GET", "POST", "PUT", "PATCH", "DELETE" } },
                                     headers = new { type = "object", additionalProperties = new { type = "string" } },
-                                    body = new { type = "object" },
-                                    scope = new { type = "string" }
+                                    body = new { type = "object" }
                                 }
                             }
                         }
@@ -211,6 +211,12 @@ public sealed class McpDiscoveryController(
 
     private async Task<IActionResult> CallToolAsync(JsonElement? responseId, JsonRpcRequest request, CancellationToken cancellationToken)
     {
+        var authResult = await authorizationService.AuthorizeAsync(User, null, "McpInvoke");
+        if (!authResult.Succeeded)
+        {
+            return StatusCode(StatusCodes.Status403Forbidden, JsonRpcError(responseId, -32003, "Forbidden"));
+        }
+
         if (request.Params.ValueKind != JsonValueKind.Object ||
             !request.Params.TryGetProperty("name", out var nameElement) ||
             !string.Equals(nameElement.GetString(), "invoke_obo_call", StringComparison.Ordinal) ||
@@ -220,16 +226,15 @@ public sealed class McpDiscoveryController(
             return Ok(JsonRpcError(responseId, -32602, "Invalid tool call arguments."));
         }
 
-        if (!argumentsElement.TryGetProperty("path", out var pathElement) || string.IsNullOrWhiteSpace(pathElement.GetString()) ||
-            !argumentsElement.TryGetProperty("method", out var methodElement) || string.IsNullOrWhiteSpace(methodElement.GetString()))
+        if (!argumentsElement.TryGetProperty("path", out var pathElement) ||
+            string.IsNullOrWhiteSpace(pathElement.GetString()) ||
+            !argumentsElement.TryGetProperty("method", out var methodElement) ||
+            string.IsNullOrWhiteSpace(methodElement.GetString()))
         {
             return Ok(JsonRpcError(responseId, -32602, "Arguments path and method are required."));
         }
 
-        if (!Request.Headers.TryGetValue("Authorization", out var authorizationHeader) ||
-            !AuthenticationHeaderValue.TryParse(authorizationHeader.ToString(), out var headerValue) ||
-            !string.Equals(headerValue.Scheme, "Bearer", StringComparison.OrdinalIgnoreCase) ||
-            string.IsNullOrWhiteSpace(headerValue.Parameter))
+        if (!TryGetBearerToken(out var incomingAccessToken))
         {
             return Ok(JsonRpcError(responseId, -32001, "Missing bearer token."));
         }
@@ -250,27 +255,45 @@ public sealed class McpDiscoveryController(
             body = bodyElement.Clone();
         }
 
-        string? scope = null;
-        if (argumentsElement.TryGetProperty("scope", out var scopeElement) && scopeElement.ValueKind == JsonValueKind.String)
-        {
-            scope = scopeElement.GetString();
-        }
-
         var oboRequest = new McpOboCallRequest
         {
             Path = pathElement.GetString()!,
             Method = methodElement.GetString()!,
             Headers = headers,
-            Body = body,
-            Scope = scope
+            Body = body
         };
 
-        var result = await oboForwardingService.ForwardAsync(headerValue.Parameter!, oboRequest, cancellationToken);
+        var result = await oboForwardingService.ForwardAsync(incomingAccessToken, oboRequest, cancellationToken);
+        var responseText = string.IsNullOrWhiteSpace(result.Body)
+            ? $"Downstream returned HTTP {(int)result.StatusCode} with empty response body."
+            : result.Body;
+
         return Ok(JsonRpcResult(responseId, new
         {
-            content = new[] { new { type = "text", text = result.Body } },
-            isError = result.StatusCode >= 400
+            content = new[]
+            {
+                new { type = "text", text = responseText }
+            },
+            isError = result.StatusCode >= 400,
+            statusCode = result.StatusCode,
+            contentType = result.ContentType
         }));
+    }
+
+    private bool TryGetBearerToken(out string token)
+    {
+        token = string.Empty;
+
+        if (!Request.Headers.TryGetValue("Authorization", out var authorizationHeader) ||
+            !AuthenticationHeaderValue.TryParse(authorizationHeader.ToString(), out var headerValue) ||
+            !string.Equals(headerValue.Scheme, "Bearer", StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(headerValue.Parameter))
+        {
+            return false;
+        }
+
+        token = headerValue.Parameter;
+        return true;
     }
 
     private static object JsonRpcResult(JsonElement? id, object result) => new { jsonrpc = "2.0", id, result };

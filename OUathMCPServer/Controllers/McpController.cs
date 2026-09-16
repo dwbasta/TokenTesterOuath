@@ -39,6 +39,11 @@ public sealed class McpController(
                 Content = result.Body
             };
         }
+        catch (UnauthorizedAccessException ex)
+        {
+            logger.LogWarning(ex, "Token correlation or audience validation failed.");
+            return Problem(detail: ex.Message, statusCode: StatusCodes.Status403Forbidden);
+        }
         catch (InvalidOperationException ex)
         {
             logger.LogError(ex, "Invalid MCP/OBO request.");

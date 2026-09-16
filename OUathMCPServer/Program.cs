@@ -18,6 +18,7 @@ var validAudiences = audiences
     .ToArray();
 
 var authority = builder.Configuration["Jwt:Authority"];
+var requiredRole = builder.Configuration["Jwt:RequiredRole"] ?? "Mcp.Invoke";
 var requiredScope = builder.Configuration["Jwt:RequiredScope"] ?? "access_as_user";
 
 if (string.IsNullOrWhiteSpace(authority) || validAudiences.Length == 0)
@@ -73,8 +74,18 @@ builder.Services.AddAuthorization(options =>
         policy.RequireAuthenticatedUser();
         policy.RequireAssertion(context =>
         {
+            var hasRole = context.User.FindAll("roles")
+                .Any(claim => string.Equals(claim.Value, requiredRole, StringComparison.OrdinalIgnoreCase));
+
+            if (hasRole)
+            {
+                return true;
+            }
+
+            // Backward compatibility for existing delegated setups.
             var scopes = context.User.FindAll("scp")
                 .SelectMany(claim => claim.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+
             return scopes.Contains(requiredScope, StringComparer.OrdinalIgnoreCase);
         });
     });
@@ -90,7 +101,6 @@ if (!app.Environment.IsDevelopment())
 app.UseHttpsRedirection();
 app.UseRouting();
 
-// Request tracing middleware (safe: no raw token logging)
 app.Use(async (context, next) =>
 {
     await next();

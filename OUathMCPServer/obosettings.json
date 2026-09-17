@@ -4,6 +4,8 @@
     "ClientSecret": "",
     "DownstreamApiBaseUrl": "",
     "DownstreamScope": "",
-    "DownstreamAudience": ""
+    "DownstreamAudience": "",
+    "WriteTokenTraceFile": true,
+    "TokenTraceFilePath": "logs/obo-token-trace.jsonl"
   }
 }

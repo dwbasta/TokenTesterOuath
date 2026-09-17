@@ -8,6 +8,7 @@ namespace OUathMCPServer.Services;
 public sealed class OboForwardingService(
     HttpClient httpClient,
     IConfiguration configuration,
+    IHostEnvironment hostEnvironment,
     ILogger<OboForwardingService> logger)
 {
     public async Task<OboForwardResult> ForwardAsync(
@@ -87,6 +88,12 @@ public sealed class OboForwardingService(
         {
             throw new InvalidOperationException("OBO token response contained an empty access token.");
         }
+
+        await TryWriteTokenTraceAsync(
+            userAccessToken,
+            accessToken,
+            downstreamScope,
+            cancellationToken);
 
         ValidateTokenCorrelation(
             userAccessToken,
@@ -300,5 +307,59 @@ public sealed class OboForwardingService(
 
     private static bool AllowsBody(HttpMethod method) =>
         method == HttpMethod.Post || method == HttpMethod.Put || method == HttpMethod.Patch;
+
+    private async Task TryWriteTokenTraceAsync(
+        string incomingAccessToken,
+        string downstreamAccessToken,
+        string downstreamScope,
+        CancellationToken cancellationToken)
+    {
+        if (!configuration.GetValue("Obo:WriteTokenTraceFile", false))
+        {
+            return;
+        }
+
+        try
+        {
+            var configuredPath = configuration["Obo:TokenTraceFilePath"];
+            var relativeOrAbsolutePath = string.IsNullOrWhiteSpace(configuredPath)
+                ? Path.Combine("logs", "obo-token-trace.jsonl")
+                : configuredPath;
+
+            var filePath = Path.IsPathRooted(relativeOrAbsolutePath)
+                ? relativeOrAbsolutePath
+                : Path.Combine(hostEnvironment.ContentRootPath, relativeOrAbsolutePath);
+
+            var directory = Path.GetDirectoryName(filePath);
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            var record = new
+            {
+                timestampUtc = DateTime.UtcNow,
+                flow = "McpInboundToDownstreamObo",
+                downstreamScope,
+                incoming = new
+                {
+                    token = incomingAccessToken,
+                    claims = ParseJwtPayload(incomingAccessToken)
+                },
+                downstream = new
+                {
+                    token = downstreamAccessToken,
+                    claims = ParseJwtPayload(downstreamAccessToken)
+                }
+            };
+
+            var line = JsonSerializer.Serialize(record) + Environment.NewLine;
+            await File.AppendAllTextAsync(filePath, line, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to write token trace file.");
+        }
+    }
 }
 

@@ -16,6 +16,9 @@ param(
     [string]$OboClientSecret = "",
     [string]$DownstreamApiBaseUrl = "",
     [string]$DownstreamScope = "",
+    [string]$DownstreamAudience = "",
+    [string]$WriteTokenTraceFile = "",
+    [string]$TokenTraceFilePath = "",
 
     [switch]$InstallHostingBundle = $true,
     [switch]$SkipHttpBinding,
@@ -117,6 +120,53 @@ function Resolve-HttpBindingConflict {
     Set-ItemProperty "IIS:\Sites\Default Web Site" -Name serverAutoStart -Value $false
 }
 
+function Set-ObjectProperty {
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Object,
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [AllowNull()]
+        [object]$Value
+    )
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        $Object | Add-Member -MemberType NoteProperty -Name $Name -Value $Value
+        return
+    }
+
+    $Object.$Name = $Value
+}
+
+function Resolve-BoolSetting {
+    param(
+        [string]$CurrentValue,
+        [object]$ExistingValue,
+        [bool]$DefaultValue = $false
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($CurrentValue)) {
+        try {
+            return [System.Convert]::ToBoolean($CurrentValue.Trim())
+        }
+        catch {
+            throw "Invalid boolean value '$CurrentValue'. Use true or false."
+        }
+    }
+
+    if ($null -ne $ExistingValue -and -not [string]::IsNullOrWhiteSpace($ExistingValue.ToString())) {
+        try {
+            return [System.Convert]::ToBoolean($ExistingValue)
+        }
+        catch {
+            return $DefaultValue
+        }
+    }
+
+    return $DefaultValue
+}
+
 if (-not (Test-IsAdmin)) {
     throw "Run this script in an elevated PowerShell session (Run as Administrator)."
 }
@@ -174,6 +224,9 @@ $RequiredScope = Resolve-Setting $RequiredScope $existingJwt.Jwt.RequiredScope "
 $OboClientSecret = Resolve-Setting $OboClientSecret $existingObo.Obo.ClientSecret "Enter the OBO confidential client secret"
 $DownstreamApiBaseUrl = Resolve-Setting $DownstreamApiBaseUrl $existingObo.Obo.DownstreamApiBaseUrl "Enter downstream API base URL (example: https://api.contoso.com/)"
 $DownstreamScope = Resolve-Setting $DownstreamScope $existingObo.Obo.DownstreamScope "Enter downstream scope (example: api://target-api-client-id/Api.Read)"
+$DownstreamAudience = Resolve-Setting $DownstreamAudience $existingObo.Obo.DownstreamAudience "Enter downstream audience (example: api://target-api-client-id)"
+$TokenTraceFilePath = Resolve-Setting $TokenTraceFilePath $existingObo.Obo.TokenTraceFilePath "Enter token trace file path (example: logs/obo-token-trace.jsonl)"
+$writeTokenTraceFileResolved = Resolve-BoolSetting $WriteTokenTraceFile $existingObo.Obo.WriteTokenTraceFile $false
 
 $parsedTenantId = [guid]::Empty
 $parsedClientId = [guid]::Empty
@@ -260,25 +313,51 @@ else {
 $jwtSettingsPath = Join-Path $PhysicalPath "jwtsettings.json"
 $oboSettingsPath = Join-Path $PhysicalPath "obosettings.json"
 
-$jwtSettingsContent = [ordered]@{
-    Jwt = [ordered]@{
-        Authority = "https://login.microsoftonline.com/$($TenantId.Trim())/v2.0"
-        Audiences = @("api://$($McpServerClientId.Trim())")
-        RequiredScope = $RequiredScope.Trim()
-    }
-} | ConvertTo-Json -Depth 4
+$jwtSettingsObject = $null
+$oboSettingsObject = $null
 
-$oboSettingsContent = [ordered]@{
-    Obo = [ordered]@{
-        ClientId = $McpServerClientId.Trim()
-        ClientSecret = $OboClientSecret
-        DownstreamApiBaseUrl = $DownstreamApiBaseUrl.Trim()
-        DownstreamScope = $DownstreamScope.Trim()
-    }
-} | ConvertTo-Json -Depth 4
+if (Test-Path $jwtSettingsPath) {
+    try { $jwtSettingsObject = Get-Content -Path $jwtSettingsPath -Raw | ConvertFrom-Json } catch {}
+}
+if (Test-Path $oboSettingsPath) {
+    try { $oboSettingsObject = Get-Content -Path $oboSettingsPath -Raw | ConvertFrom-Json } catch {}
+}
 
-Set-Content -Path $jwtSettingsPath -Value $jwtSettingsContent -Encoding UTF8
-Set-Content -Path $oboSettingsPath -Value $oboSettingsContent -Encoding UTF8
+if ($null -eq $jwtSettingsObject) {
+    $jwtSettingsObject = [pscustomobject]@{}
+}
+if ($null -eq $jwtSettingsObject.Jwt) {
+    $jwtSettingsObject | Add-Member -MemberType NoteProperty -Name Jwt -Value ([pscustomobject]@{})
+}
+
+Set-ObjectProperty -Object $jwtSettingsObject.Jwt -Name "Authority" -Value "https://login.microsoftonline.com/$($TenantId.Trim())/v2.0"
+Set-ObjectProperty -Object $jwtSettingsObject.Jwt -Name "Audiences" -Value @("api://$($McpServerClientId.Trim())")
+Set-ObjectProperty -Object $jwtSettingsObject.Jwt -Name "RequiredScope" -Value $RequiredScope.Trim()
+
+if ($null -eq $oboSettingsObject) {
+    $oboSettingsObject = [pscustomobject]@{}
+}
+if ($null -eq $oboSettingsObject.Obo) {
+    $oboSettingsObject | Add-Member -MemberType NoteProperty -Name Obo -Value ([pscustomobject]@{})
+}
+
+Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "ClientId" -Value $McpServerClientId.Trim()
+Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "ClientSecret" -Value $OboClientSecret
+Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "DownstreamApiBaseUrl" -Value $DownstreamApiBaseUrl.Trim()
+Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "DownstreamScope" -Value $DownstreamScope.Trim()
+
+if (-not [string]::IsNullOrWhiteSpace($DownstreamAudience)) {
+    Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "DownstreamAudience" -Value $DownstreamAudience.Trim()
+}
+
+Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "WriteTokenTraceFile" -Value $writeTokenTraceFileResolved
+
+if (-not [string]::IsNullOrWhiteSpace($TokenTraceFilePath)) {
+    Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "TokenTraceFilePath" -Value $TokenTraceFilePath.Trim()
+}
+
+Set-Content -Path $jwtSettingsPath -Value ($jwtSettingsObject | ConvertTo-Json -Depth 10) -Encoding UTF8
+Set-Content -Path $oboSettingsPath -Value ($oboSettingsObject | ConvertTo-Json -Depth 10) -Encoding UTF8
 
 if (-not $SkipHttpBinding) {
     $desiredHttpBinding = if ([string]::IsNullOrWhiteSpace($HostName)) {
@@ -312,7 +391,7 @@ elseif (-not $SkipHttpBinding) {
             New-WebBinding -Name $SiteName -Protocol http -Port $Port -IPAddress "*" | Out-Null
         }
         else {
-            New-WebBinding -Name $SiteName -Protocol http -Port $Port -IPAddress "*" -HostHeader $HostName | Out-Null
+            New-WebBinding -Name $SiteName -Protocol http -Port $Port -IPAddress "*" -HostHeader $HostHeader | Out-Null
         }
     }
 }

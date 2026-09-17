@@ -376,14 +376,15 @@ To better understand the interactions between components, refer to the following
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Client as Calling Client App
-    participant Entra as Microsoft Entra ID
-    participant API as Protected API
+    participant App as "Calling Client App"
+    participant Entra as "Microsoft Entra ID"
+    participant API as "Protected API"
 
-    Client->>Entra: POST /token (client_credentials, scope=api://<protected-api-app-id>/.default)
-    Entra-->>Client: Access token (app-only)
-    Client->>API: GET /api/data with Bearer token
-    API-->>Client: 200 OK (if app role like Api.Read is assigned)
+    App->>Entra: "POST /token grant_type=client_credentials scope=api://<protected-api-app-id>/.default"
+    Entra-->>App: "Access token (app-only)"
+    App->>API: "GET /api/data with Bearer token"
+    API->>API: "Validate iss/aud + app role (e.g., Api.Read)"
+    API-->>App: "200 OK or 403 Forbidden"
 ```
 
 ## 16. Exercise 2: Delegated MCP flow example (Copilot -> MCP -> API via OBO)
@@ -408,6 +409,25 @@ In `OUathMCPServer\obosettings.json`:
   }
 }
 
+### OBO token validation and entitlement checks
+
+For Exercise 2, enforce validation at **both** hops:
+
+1. **MCP inbound token validation**
+   - Validate issuer (`iss`) and audience (`aud=api://<mcp-api-app-id>`).
+   - Require delegated scope `scp=access_as_user`.
+   - Reject invalid/missing token with `401 Unauthorized`.
+
+2. **Protected API entitlement validation**
+   - Validate downstream OBO token issuer and audience (`aud=api://<protected-api-app-id>`).
+   - Enforce required delegated scope or role for the target endpoint.
+   - If token is valid but missing entitlement, return `403 Forbidden`.
+
+Recommended outcome mapping:
+
+- `401 Unauthorized`: token missing, invalid, expired, wrong issuer, or wrong audience.
+- `403 Forbidden`: token valid, but user/app lacks required permission for endpoint.
+
 ### Flow Diagram
 
 ```mermaid
@@ -429,47 +449,56 @@ sequenceDiagram
     MCP->>API: Call protected endpoint with downstream token
     API-->>MCP: Protected data response
     MCP-->>Copilot: MCP tool/result response
+
 ```
 
-## 17. Entra app permission wiring (MCP + Protected API)
+## 17. Test-only access token trace logging (MCP)
 
-Use this section for app permission setup, and use "MCP runtime token validation" wording for runtime checks.
+For troubleshooting OAuth/OBO flows, the MCP server can write both the inbound token (client -> MCP) and downstream OBO token (MCP -> API) to a JSONL trace file.
 
-Use the following permission model for this solution:
+> Security warning: this logs raw bearer tokens. Enable only in test environments and disable immediately after troubleshooting.
 
-1. **Copilot client app -> MCP server**
-   - Add delegated permission to MCP scope: `api://<mcp-api-app-id>/access_as_user`
-   - Grant admin consent.
-2. **MCP server app -> Protected API**
-   - Add delegated permission(s) required by downstream endpoints (example: `Competitor.Reader`, `Recipe.Reader`, `Api.Read`).
-   - Grant admin consent.
-3. **Copilot agent -> MCP server**
-   - Ensure MCP accepts delegated scope `access_as_user` in incoming tokens.
-   - In MCP app registration (`Expose an API`), scope `access_as_user` must be enabled.
+### `OUathMCPServer/obosettings.json`
 
-![MCP server API permissions showing delegated downstream API permission setup](docs/images/mcpserver-api-permissions-delegated.png)
-
-### MCP app registration checks
-
-In the MCP server app registration:
-
-- `Expose an API`:
-  - Application ID URI is set (example: `api://<mcp-api-app-id>`)
-  - Scope exists: `access_as_user`
-- `Authorized client applications`:
-  - Add `<copilot-client-app-id>`
-  - Authorize scope `access_as_user`
-
-![MCP server Expose an API with authorized client application for access_as_user](docs/images/mcpserver-expose-api-authorized-client.png)
-
-In `OUathMCPServer\jwtsettings.json`, ensure:
- 
 {
-  "Jwt": {
-    "Authority": "https://login.microsoftonline.com/<tenant-id>/v2.0",
-    "Audiences": [
-      "api://<mcp-api-app-id>"
-    ],
-    "RequiredScope": "access_as_user"
+  "Obo": {
+    "WriteTokenTraceFile": true,
+    "TokenTraceFilePath": "logs/obo-token-trace.jsonl"
+  }
+}
+- `WriteTokenTraceFile`: enables token trace output.
+- `TokenTraceFilePath`: relative path under app root, or absolute path.
+
+### IIS permission requirement
+
+The IIS app pool identity must have write access to the trace folder.
+
+```powershell
+Import-Module WebAdministration
+$sitePath = "C:\inetpub\wwwroot\OUathMCPServer"
+$appPool = "OUathMCPServerPool"
+
+New-Item -ItemType Directory -Path "$sitePath\logs" -Force | Out-Null
+icacls "$sitePath\logs" /grant "IIS AppPool\${appPool}:(OI)(CI)(M)" /T
+Restart-WebAppPool -Name $appPool
+```
+
+### Verify trace output
+
+After issuing an MCP tool call, check:
+
+```powershell
+Get-Content "C:\inetpub\wwwroot\OUathMCPServer\logs\obo-token-trace.jsonl" -Tail 1
+```
+
+Each line contains:
+- `incoming.token` + decoded claims (token received by MCP)
+- `downstream.token` + decoded claims (OBO token sent to downstream API)
+
+Disable tracing when done:
+
+{
+  "Obo": {
+    "WriteTokenTraceFile": false
   }
 }

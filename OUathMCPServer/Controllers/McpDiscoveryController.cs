@@ -107,17 +107,55 @@ public sealed class McpDiscoveryController(
                         new
                         {
                             name = "invoke_obo_call",
-                            description = "Performs OBO token exchange and calls downstream API.",
+                            description = "Calls the downstream protected API through OBO. Use only documented /api/data endpoints.",
                             inputSchema = new
                             {
                                 type = "object",
+                                additionalProperties = false,
                                 required = new[] { "path", "method" },
                                 properties = new
                                 {
-                                    path = new { type = "string" },
-                                    method = new { type = "string", @enum = new[] { "GET", "POST", "PUT", "PATCH", "DELETE" } },
-                                    headers = new { type = "object", additionalProperties = new { type = "string" } },
-                                    body = new { type = "object" }
+                                    path = new
+                                    {
+                                        type = "string",
+                                        description = "Relative downstream path. Must start with /api/data.",
+                                        pattern = "^/api/data(?:/.*)?$",
+                                        @enum = new[]
+                                        {
+                                            "/api/data",
+                                            "/api/data/employees",
+                                            "/api/data/competitors",
+                                            "/api/data/recipes",
+                                            "/api/data/recipies",
+                                            "/api/data/inventory",
+                                            "/api/data/sales/daily",
+                                            "/api/data/customers",
+                                            "/api/data/locations",
+                                            "/api/data/reviews",
+                                            "/api/data/inspections",
+                                            "/api/data/employee-of-the-month",
+                                            "/api/data/secret-formula/status",
+                                            "/api/data/underwater-weather",
+                                            "/api/data/health/ingredients"
+                                        }
+                                    },
+                                    method = new
+                                    {
+                                        type = "string",
+                                        description = "HTTP method for downstream call.",
+                                        @enum = new[] { "GET", "POST", "PUT", "PATCH", "DELETE" }
+                                    },
+                                    headers = new
+                                    {
+                                        type = "object",
+                                        description = "Optional additional headers. Authorization is ignored and set by MCP.",
+                                        additionalProperties = new { type = "string" }
+                                    },
+                                    body = new
+                                    {
+                                        type = "object",
+                                        description = "Optional JSON body for POST/PUT/PATCH."
+                                    }
                                 }
                             }
                         }

@@ -1,10 +1,14 @@
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
-using System.Security.Claims;
+using Microsoft.IdentityModel.Logging;
 using Microsoft.IdentityModel.Tokens;
+using System.Security.Claims;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Configuration.AddJsonFile("jwtsettings.json", optional: true, reloadOnChange: false);
+
+IdentityModelEventSource.ShowPII = true;
 
 builder.Services.AddControllers();
 
@@ -17,37 +21,36 @@ var validAudiences = audiences
     .ToArray();
 
 var authority = builder.Configuration["Jwt:Authority"];
-var apiDisplayName = builder.Configuration["Api:DisplayName"] ?? "Token API";
+var configuredIssuers = builder.Configuration.GetSection("Jwt:ValidIssuers").Get<string[]>() ?? Array.Empty<string>();
+var validIssuers = configuredIssuers
+    .Where(issuer => !string.IsNullOrWhiteSpace(issuer))
+    .Select(issuer => issuer.Trim())
+    .Distinct(StringComparer.OrdinalIgnoreCase)
+    .ToArray();
 
+var apiDisplayName = builder.Configuration["Api:DisplayName"] ?? "Token API";
 var defaultReadRole = builder.Configuration["Jwt:RequiredRole"] ?? "Api.Read";
 var writeRole = builder.Configuration["Jwt:RequiredWriteRole"] ?? "Api.Write";
+var defaultReadScope = builder.Configuration["Jwt:RequiredScope"] ?? "api.read";
+var writeScope = builder.Configuration["Jwt:RequiredWriteScope"] ?? "api.write";
+var roleClaimType = builder.Configuration["Jwt:RoleClaimType"] ?? "roles";
+var nameClaimType = builder.Configuration["Jwt:NameClaimType"] ?? "appid";
 
 if (string.IsNullOrWhiteSpace(authority) || validAudiences.Length == 0)
 {
     throw new InvalidOperationException(
-        "JWT configuration is incomplete. Ensure jwtsettings.json is configured with Jwt:Authority and Jwt:Audiences.");
+        "JWT configuration is incomplete. Ensure jwtsettings.json has Jwt:Authority and Jwt:Audiences.");
 }
 
-if (!Uri.TryCreate(authority, UriKind.Absolute, out var authorityUri))
+if (!Uri.TryCreate(authority, UriKind.Absolute, out _))
 {
     throw new InvalidOperationException("Jwt:Authority must be a valid absolute URI.");
 }
 
-var authorityPathSegments = authorityUri.AbsolutePath
-    .Trim('/')
-    .Split('/', StringSplitOptions.RemoveEmptyEntries);
-
-if (authorityPathSegments.Length == 0)
+if (validIssuers.Length == 0)
 {
-    throw new InvalidOperationException("Jwt:Authority must include a tenant segment.");
+    validIssuers = new[] { authority.TrimEnd('/') };
 }
-
-var tenantSegment = authorityPathSegments[0];
-var validIssuers = new[]
-{
-    $"https://login.microsoftonline.com/{tenantSegment}/v2.0",
-    $"https://sts.windows.net/{tenantSegment}/"
-};
 
 builder.Services
     .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -56,6 +59,7 @@ builder.Services
         options.Authority = authority;
         options.RequireHttpsMetadata = true;
         options.MapInboundClaims = false;
+        options.IncludeErrorDetails = true;
         options.TokenValidationParameters = new TokenValidationParameters
         {
             ValidateIssuer = true,
@@ -63,30 +67,47 @@ builder.Services
             ValidateAudience = true,
             ValidAudiences = validAudiences,
             ValidateLifetime = true,
-            RoleClaimType = "roles",
-            NameClaimType = "appid",
+            RoleClaimType = roleClaimType,
+            NameClaimType = nameClaimType,
             ClockSkew = TimeSpan.FromMinutes(2)
         };
 
         options.Events = new JwtBearerEvents
         {
+            OnMessageReceived = context =>
+            {
+                var logger = context.HttpContext.RequestServices
+                    .GetRequiredService<ILoggerFactory>()
+                    .CreateLogger("JwtAuth");
+                var hasAuthHeader = context.Request.Headers.ContainsKey("Authorization");
+                logger.LogInformation("Authorization header present: {Present}", hasAuthHeader);
+                return Task.CompletedTask;
+            },
+            OnTokenValidated = context =>
+            {
+                var logger = context.HttpContext.RequestServices
+                    .GetRequiredService<ILoggerFactory>()
+                    .CreateLogger("JwtAuth");
+                logger.LogInformation("Token validated. iss={Issuer}, aud={Audience}",
+                    context.Principal?.FindFirst("iss")?.Value,
+                    context.Principal?.FindFirst("aud")?.Value);
+                return Task.CompletedTask;
+            },
             OnAuthenticationFailed = context =>
             {
                 var logger = context.HttpContext.RequestServices
                     .GetRequiredService<ILoggerFactory>()
-                    .CreateLogger("JwtAuthentication");
-                logger.LogError(context.Exception, "JWT authentication failed for {Path}.", context.HttpContext.Request.Path);
+                    .CreateLogger("JwtAuth");
+                logger.LogError(context.Exception, "JWT authentication failed.");
                 return Task.CompletedTask;
             },
-            OnForbidden = context =>
+            OnChallenge = context =>
             {
                 var logger = context.HttpContext.RequestServices
                     .GetRequiredService<ILoggerFactory>()
-                    .CreateLogger("JwtAuthorization");
-                var roles = context.HttpContext.User.FindAll("roles").Select(claim => claim.Value).ToArray();
-                logger.LogWarning("Authorization denied for {Path}. Roles: {Roles}.",
-                    context.HttpContext.Request.Path,
-                    roles.Length == 0 ? "<none>" : string.Join(", ", roles));
+                    .CreateLogger("JwtAuth");
+                logger.LogWarning("JWT challenge. Error={Error}, Description={Description}",
+                    context.Error, context.ErrorDescription);
                 return Task.CompletedTask;
             }
         };
@@ -94,9 +115,91 @@ builder.Services
 
 builder.Services.AddAuthorization(options =>
 {
-    static bool HasRole(ClaimsPrincipal user, string requiredRole) =>
-        user.FindAll("roles")
+    bool HasRole(ClaimsPrincipal user, string requiredRole)
+    {
+        if (string.IsNullOrWhiteSpace(requiredRole))
+        {
+            return false;
+        }
+
+        return user.FindAll(roleClaimType)
             .Any(claim => string.Equals(claim.Value, requiredRole, StringComparison.OrdinalIgnoreCase));
+    }
+
+    static IEnumerable<string> SplitClaimValues(ClaimsPrincipal user, string claimType) =>
+        user.FindAll(claimType)
+            .SelectMany(claim => ExpandClaimValue(claim.Value));
+
+    static IEnumerable<string> ExpandClaimValue(string? rawValue)
+    {
+        if (string.IsNullOrWhiteSpace(rawValue))
+        {
+            yield break;
+        }
+
+        var trimmed = rawValue.Trim();
+
+        // Handle JSON array claims like: ["api.read","competitor.read"]
+        if (trimmed.StartsWith("[", StringComparison.Ordinal) &&
+            TryParseJsonStringArray(trimmed, out var jsonValues))
+        {
+            foreach (var value in jsonValues)
+            {
+                yield return value;
+            }
+
+            yield break;
+        }
+
+        foreach (var part in trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+        {
+            yield return part;
+        }
+    }
+
+    static bool TryParseJsonStringArray(string value, out string[] values)
+    {
+        values = [];
+
+        try
+        {
+            using var json = JsonDocument.Parse(value);
+            if (json.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                return false;
+            }
+
+            values = json.RootElement
+                .EnumerateArray()
+                .Where(element => element.ValueKind == JsonValueKind.String)
+                .Select(element => element.GetString())
+                .Where(item => !string.IsNullOrWhiteSpace(item))
+                .Select(item => item!.Trim())
+                .ToArray();
+
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    static bool HasScopeOrPermission(ClaimsPrincipal user, string requiredValue)
+    {
+        if (string.IsNullOrWhiteSpace(requiredValue))
+        {
+            return false;
+        }
+
+        return SplitClaimValues(user, "scope")
+            .Concat(SplitClaimValues(user, "scp"))
+            .Concat(SplitClaimValues(user, "permissions"))
+            .Any(value => string.Equals(value, requiredValue, StringComparison.OrdinalIgnoreCase));
+    }
+
+    static bool IsClientCredentialsToken(ClaimsPrincipal user) =>
+        string.Equals(user.FindFirst("gty")?.Value, "client-credentials", StringComparison.OrdinalIgnoreCase);
 
     static string GetPath(AuthorizationHandlerContext context)
     {
@@ -115,20 +218,20 @@ builder.Services.AddAuthorization(options =>
 
     var endpointRequirements = new[]
     {
-        new { Prefix = "/api/data/competitors", Role = "Competitor.Reader" },
-        new { Prefix = "/api/data/recipes", Role = "Recipe.Reader" },
-        new { Prefix = "/api/data/recipies", Role = "Recipe.Reader" },
-        new { Prefix = "/api/data/employees", Role = "Employee.Reader" },
-        new { Prefix = "/api/data/inventory", Role = "Inventory.Reader" },
-        new { Prefix = "/api/data/sales", Role = "Sales.Reader" },
-        new { Prefix = "/api/data/customers", Role = "Customer.Reader" },
-        new { Prefix = "/api/data/locations", Role = "Location.Reader" },
-        new { Prefix = "/api/data/reviews", Role = "Review.Reader" },
-        new { Prefix = "/api/data/inspections", Role = "Inspection.Reader" },
-        new { Prefix = "/api/data/employee-of-the-month", Role = "Employee.Reader" },
-        new { Prefix = "/api/data/secret-formula/status", Role = "SecretFormula.Reader" },
-        new { Prefix = "/api/data/underwater-weather", Role = "Weather.Reader" },
-        new { Prefix = "/api/data/health/ingredients", Role = "IngredientHealth.Reader" }
+        new { Prefix = "/api/data/competitors", Role = "Competitor.Reader", Permission = "competitor.read" },
+        new { Prefix = "/api/data/recipes", Role = "Recipe.Reader", Permission = "recipe.read" },
+        new { Prefix = "/api/data/recipies", Role = "Recipe.Reader", Permission = "recipe.read" },
+        new { Prefix = "/api/data/employees", Role = "Employee.Reader", Permission = "employee.read" },
+        new { Prefix = "/api/data/inventory", Role = "Inventory.Reader", Permission = "inventory.read" },
+        new { Prefix = "/api/data/sales", Role = "Sales.Reader", Permission = "sales.read" },
+        new { Prefix = "/api/data/customers", Role = "Customer.Reader", Permission = "customer.read" },
+        new { Prefix = "/api/data/locations", Role = "Location.Reader", Permission = "location.read" },
+        new { Prefix = "/api/data/reviews", Role = "Review.Reader", Permission = "review.read" },
+        new { Prefix = "/api/data/inspections", Role = "Inspection.Reader", Permission = "inspection.read" },
+        new { Prefix = "/api/data/employee-of-the-month", Role = "Employee.Reader", Permission = "employee.read" },
+        new { Prefix = "/api/data/secret-formula/status", Role = "SecretFormula.Reader", Permission = "secretformula.read" },
+        new { Prefix = "/api/data/underwater-weather", Role = "Weather.Reader", Permission = "weather.read" },
+        new { Prefix = "/api/data/health/ingredients", Role = "IngredientHealth.Reader", Permission = "ingredienthealth.read" }
     };
 
     options.AddPolicy("ApiRead", policy =>
@@ -142,17 +245,22 @@ builder.Services.AddAuthorization(options =>
 
             if (requirement is null)
             {
-                return HasRole(context.User, defaultReadRole);
+                return HasRole(context.User, defaultReadRole) ||
+                    HasScopeOrPermission(context.User, defaultReadScope);
             }
 
-            return HasRole(context.User, requirement.Role);
+            return HasRole(context.User, requirement.Role) ||
+                HasScopeOrPermission(context.User, requirement.Permission) ||
+                (IsClientCredentialsToken(context.User) && HasScopeOrPermission(context.User, defaultReadScope));
         });
     });
 
     options.AddPolicy("ApiWrite", policy =>
     {
         policy.RequireAuthenticatedUser();
-        policy.RequireAssertion(context => HasRole(context.User, writeRole));
+        policy.RequireAssertion(context =>
+            HasRole(context.User, writeRole) ||
+            (IsClientCredentialsToken(context.User) && HasScopeOrPermission(context.User, writeScope)));
     });
 });
 
@@ -166,42 +274,8 @@ if (!app.Environment.IsDevelopment())
 app.UseHttpsRedirection();
 app.UseStaticFiles();
 app.UseRouting();
-
 app.UseAuthentication();
 app.UseAuthorization();
-
-app.Use(async (context, next) =>
-{
-    await next();
-
-    if (!context.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase))
-    {
-        return;
-    }
-
-    if (context.Response.HasStarted)
-    {
-        return;
-    }
-
-    if (context.Response.StatusCode is StatusCodes.Status401Unauthorized or StatusCodes.Status403Forbidden)
-    {
-        context.Response.ContentType = "application/problem+json";
-
-        var problem = new
-        {
-            type = "https://httpstatuses.com/" + context.Response.StatusCode,
-            title = context.Response.StatusCode == StatusCodes.Status401Unauthorized ? "Unauthorized" : "Forbidden",
-            status = context.Response.StatusCode,
-            traceId = context.TraceIdentifier,
-            detail = context.Response.StatusCode == StatusCodes.Status401Unauthorized
-                ? "Token validation failed or token was not provided."
-                : "Token is valid, but required role/scope for this endpoint is missing."
-        };
-
-        await context.Response.WriteAsJsonAsync(problem);
-    }
-});
 
 app.MapControllers();
 app.MapGet("/", () => Results.Redirect("/index.html"));

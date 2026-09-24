@@ -2,5 +2,40 @@
   "Jwt": {
     "Authority": "",
     "Audiences": []
+  },
+  "Identity": {
+    "ActiveProvider": "Auth0",
+    "Providers": {
+      "Entra": {
+        "Authority": "https://login.microsoftonline.com/<tenant>/v2.0",
+        "ValidIssuers": [
+          "https://login.microsoftonline.com/<tenant>/v2.0",
+          "https://sts.windows.net/<tenant>/"
+        ],
+        "Audiences": [ "api://<app-id>" ],
+        "RoleClaims": [ "roles" ],
+        "ScopeClaims": [ "scp" ],
+        "PermissionClaims": []
+      },
+      "Auth0": {
+        "Authority": "https://dev-resurgemus.us.auth0.com/",
+        "ValidIssuers": [
+          "https://dev-resurgemus.us.auth0.com",
+          "https://dev-resurgemus.us.auth0.com/"
+        ],
+        "Audiences": [ "OKTAAPP.Resurgemus.xyz" ],
+        "RoleClaims": [ "roles", "https://oktaapp.resurgemus.xyz/roles" ],
+        "ScopeClaims": [ "scope", "scp" ],
+        "PermissionClaims": [ "permissions" ]
+      },
+      "ADFS": {
+        "Authority": "https://adfs.contoso.com/adfs",
+        "ValidIssuers": [ "https://adfs.contoso.com/adfs" ],
+        "Audiences": [ "https://api.contoso.com" ],
+        "RoleClaims": [ "role", "roles" ],
+        "ScopeClaims": [ "scp", "scope" ],
+        "PermissionClaims": []
+      }
+    }
   }
 }

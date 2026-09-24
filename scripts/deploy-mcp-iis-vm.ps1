@@ -9,17 +9,23 @@ param(
     [int]$Port = 80,
     [string]$HostName = "",
 
+    [string]$IdentityProvider = "",
     [string]$TenantId = "",
     [string]$McpServerClientId = "",
+    [string]$OktaAuthority = "",
+    [string]$OktaMcpAudience = "",
+    [string]$OktaValidIssuersCsv = "",
     [string]$RequiredScope = "access_as_user",
-
     [string]$OboClientSecret = "",
     [string]$DownstreamApiBaseUrl = "",
     [string]$DownstreamScope = "",
     [string]$DownstreamAudience = "",
+    [string]$OboTokenEndpoint = "",
+    [string]$OboGrantType = "",
     [string]$WriteTokenTraceFile = "",
     [string]$TokenTraceFilePath = "",
 
+    [switch]$OverwriteRuntimeConfig,
     [switch]$InstallHostingBundle = $true,
     [switch]$SkipHttpBinding,
     [string]$HostingBundleUrl = "https://aka.ms/dotnet/8.0/dotnet-hosting-win.exe"
@@ -49,6 +55,57 @@ function Resolve-Setting {
     }
 
     return (Read-Host $Prompt).Trim()
+}
+
+function Resolve-IdentityProvider {
+    param(
+        [string]$CurrentProvider,
+        [string]$ExistingProvider,
+        [string]$ExistingAuthority
+    )
+
+    $candidate = ""
+    if (-not [string]::IsNullOrWhiteSpace($CurrentProvider)) {
+        $candidate = $CurrentProvider.Trim()
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($ExistingProvider)) {
+        $candidate = $ExistingProvider.Trim()
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($ExistingAuthority)) {
+        if ($ExistingAuthority -match "login\.microsoftonline\.com") {
+            $candidate = "Entra"
+        }
+        elseif ($ExistingAuthority -match "/oauth2/") {
+            $candidate = "Okta"
+        }
+    }
+    else {
+        $candidate = (Read-Host "Identity provider (Entra/Okta)").Trim()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        throw "Identity provider is required. Enter Entra or Okta."
+    }
+
+    switch ($candidate.ToLowerInvariant()) {
+        "entra" { return "Entra" }
+        "okta" { return "Okta" }
+        default { throw "Unsupported identity provider '$candidate'. Use Entra or Okta." }
+    }
+}
+
+function Split-CsvValues {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return @()
+    }
+
+    return @(
+        $Value.Split(",") |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
 }
 
 function Copy-DeploymentContent {
@@ -212,34 +269,137 @@ if (Test-Path $existingOboPath) {
     try { $existingObo = Get-Content -Path $existingOboPath -Raw | ConvertFrom-Json } catch {}
 }
 
-$TenantId = Resolve-Setting $TenantId $existingJwt.Jwt.Authority "Enter the Entra tenant ID"
-if ($TenantId -like "https://login.microsoftonline.com/*/v2.0") {
-    $TenantId = ($TenantId -replace "^https://login\.microsoftonline\.com/", "") -replace "/v2\.0$", ""
+$existingProvider = ""
+$existingAuthority = ""
+$existingMcpAudience = ""
+$existingValidIssuersCsv = ""
+
+if ($null -ne $existingJwt -and $null -ne $existingJwt.Jwt) {
+    if ($null -ne $existingJwt.Jwt.Provider) {
+        $existingProvider = $existingJwt.Jwt.Provider.ToString()
+    }
+    if ($null -ne $existingJwt.Jwt.Authority) {
+        $existingAuthority = $existingJwt.Jwt.Authority.ToString()
+    }
+
+    $existingAudiences = @($existingJwt.Jwt.Audiences)
+    if ($existingAudiences.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($existingAudiences[0])) {
+        $existingMcpAudience = $existingAudiences[0].ToString()
+    }
+
+    $existingIssuers = @($existingJwt.Jwt.ValidIssuers)
+    if ($existingIssuers.Count -gt 0) {
+        $existingValidIssuersCsv = ($existingIssuers -join ",")
+    }
 }
 
-$McpServerClientId = Resolve-Setting $McpServerClientId ($existingJwt.Jwt.Audiences | Select-Object -First 1) "Enter the MCP Server app registration Client ID"
-$McpServerClientId = $McpServerClientId -replace "^api://", ""
+$IdentityProvider = Resolve-IdentityProvider -CurrentProvider $IdentityProvider -ExistingProvider $existingProvider -ExistingAuthority $existingAuthority
 
 $RequiredScope = Resolve-Setting $RequiredScope $existingJwt.Jwt.RequiredScope "Enter required delegated scope"
+
+$resolvedAuthority = ""
+$resolvedValidIssuers = @()
+$resolvedMcpAudiences = @()
+$resolvedMcpClientId = ""
+$resolvedOboTokenEndpoint = ""
+$resolvedOboGrantType = ""
+
+if ($IdentityProvider -eq "Entra") {
+    $TenantId = Resolve-Setting $TenantId "" "Enter the Entra tenant ID"
+
+    if ($TenantId -like "https://login.microsoftonline.com/*/v2.0") {
+        $TenantId = ($TenantId -replace "^https://login\.microsoftonline\.com/", "") -replace "/v2\.0$", ""
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($existingMcpAudience)) {
+        $existingMcpAudience = $existingMcpAudience -replace "^api://", ""
+    }
+
+    $McpServerClientId = Resolve-Setting $McpServerClientId $existingMcpAudience "Enter the MCP Server app registration Client ID"
+
+    $parsedTenantId = [guid]::Empty
+    $parsedClientId = [guid]::Empty
+
+    if (-not [guid]::TryParse($TenantId.Trim(), [ref]$parsedTenantId)) {
+        throw "Tenant ID must be a valid GUID for Entra."
+    }
+    if (-not [guid]::TryParse($McpServerClientId.Trim(), [ref]$parsedClientId)) {
+        throw "MCP Server Client ID must be a valid GUID for Entra."
+    }
+
+    $resolvedAuthority = "https://login.microsoftonline.com/$($TenantId.Trim())/v2.0"
+    $resolvedValidIssuers = @(
+        "https://login.microsoftonline.com/$($TenantId.Trim())/v2.0",
+        "https://sts.windows.net/$($TenantId.Trim())/"
+    )
+    $resolvedMcpAudiences = @("api://$($McpServerClientId.Trim())")
+    $resolvedMcpClientId = $McpServerClientId.Trim()
+    $resolvedOboTokenEndpoint = "https://login.microsoftonline.com/$($TenantId.Trim())/oauth2/v2.0/token"
+    $resolvedOboGrantType = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+}
+else {
+    $OktaAuthority = Resolve-Setting $OktaAuthority $existingAuthority "Enter Okta authority/issuer URL (example: https://dev-123456.okta.com/oauth2/default)"
+    $OktaMcpAudience = Resolve-Setting $OktaMcpAudience $existingMcpAudience "Enter MCP audience (example: api://mcp-server)"
+    $McpServerClientId = Resolve-Setting $McpServerClientId $existingObo.Obo.ClientId "Enter MCP confidential client ID"
+
+    if (-not [Uri]::TryCreate($OktaAuthority, [UriKind]::Absolute, [ref]([Uri]$null))) {
+        throw "OktaAuthority must be a valid absolute URI."
+    }
+
+    $resolvedAuthority = $OktaAuthority.TrimEnd('/')
+    $resolvedMcpAudiences = @(Split-CsvValues -Value $OktaMcpAudience)
+    if ($resolvedMcpAudiences.Count -eq 0) {
+        throw "At least one MCP audience is required for Okta."
+    }
+
+    $effectiveIssuersCsv = Resolve-Setting $OktaValidIssuersCsv $existingValidIssuersCsv "Enter valid issuers CSV (leave blank to use authority only)"
+    $resolvedValidIssuers = Split-CsvValues -Value $effectiveIssuersCsv
+    if ($resolvedValidIssuers.Count -eq 0) {
+        $resolvedValidIssuers = @($resolvedAuthority)
+    }
+
+    $resolvedMcpClientId = $McpServerClientId.Trim()
+
+    $existingTokenEndpoint = ""
+    if ($null -ne $existingObo -and $null -ne $existingObo.Obo -and $null -ne $existingObo.Obo.TokenEndpoint) {
+        $existingTokenEndpoint = $existingObo.Obo.TokenEndpoint.ToString()
+    }
+
+    $existingGrantType = ""
+    if ($null -ne $existingObo -and $null -ne $existingObo.Obo -and $null -ne $existingObo.Obo.GrantType) {
+        $existingGrantType = $existingObo.Obo.GrantType.ToString()
+    }
+
+    $OboTokenEndpoint = Resolve-Setting $OboTokenEndpoint $existingTokenEndpoint "Enter Okta token endpoint (leave blank to use <authority>/v1/token)"
+    if ([string]::IsNullOrWhiteSpace($OboTokenEndpoint)) {
+        $OboTokenEndpoint = "$resolvedAuthority/v1/token"
+    }
+
+    $OboGrantType = Resolve-Setting $OboGrantType $existingGrantType "Enter OBO grant type (default: urn:ietf:params:oauth:grant-type:token-exchange)"
+    if ([string]::IsNullOrWhiteSpace($OboGrantType)) {
+        $OboGrantType = "urn:ietf:params:oauth:grant-type:token-exchange"
+    }
+
+    $resolvedOboTokenEndpoint = $OboTokenEndpoint.Trim()
+    $resolvedOboGrantType = $OboGrantType.Trim()
+}
+
 $OboClientSecret = Resolve-Setting $OboClientSecret $existingObo.Obo.ClientSecret "Enter the OBO confidential client secret"
 $DownstreamApiBaseUrl = Resolve-Setting $DownstreamApiBaseUrl $existingObo.Obo.DownstreamApiBaseUrl "Enter downstream API base URL (example: https://api.contoso.com/)"
-$DownstreamScope = Resolve-Setting $DownstreamScope $existingObo.Obo.DownstreamScope "Enter downstream scope (example: api://target-api-client-id/Api.Read)"
+$DownstreamScope = Resolve-Setting $DownstreamScope $existingObo.Obo.DownstreamScope "Enter downstream scope (example Entra: api://target-api-client-id/Api.Read, Okta: api.read)"
 $DownstreamAudience = Resolve-Setting $DownstreamAudience $existingObo.Obo.DownstreamAudience "Enter downstream audience (example: api://target-api-client-id)"
 $TokenTraceFilePath = Resolve-Setting $TokenTraceFilePath $existingObo.Obo.TokenTraceFilePath "Enter token trace file path (example: logs/obo-token-trace.jsonl)"
 $writeTokenTraceFileResolved = Resolve-BoolSetting $WriteTokenTraceFile $existingObo.Obo.WriteTokenTraceFile $false
 
-$parsedTenantId = [guid]::Empty
-$parsedClientId = [guid]::Empty
 $parsedDownstreamUri = $null
-
-if (-not [guid]::TryParse($TenantId.Trim(), [ref]$parsedTenantId)) {
-    throw "Tenant ID must be a valid GUID."
-}
-if (-not [guid]::TryParse($McpServerClientId.Trim(), [ref]$parsedClientId)) {
-    throw "MCP Server Client ID must be a valid GUID."
-}
 if (-not [Uri]::TryCreate($DownstreamApiBaseUrl.Trim(), [UriKind]::Absolute, [ref]$parsedDownstreamUri)) {
     throw "DownstreamApiBaseUrl must be a valid absolute URI."
+}
+if (-not [Uri]::TryCreate($resolvedAuthority, [UriKind]::Absolute, [ref]([Uri]$null))) {
+    throw "Resolved JWT authority must be a valid absolute URI."
+}
+if (-not [Uri]::TryCreate($resolvedOboTokenEndpoint, [UriKind]::Absolute, [ref]([Uri]$null))) {
+    throw "OboTokenEndpoint must be a valid absolute URI."
 }
 
 Import-Module WebAdministration
@@ -330,8 +490,11 @@ if ($null -eq $jwtSettingsObject.Jwt) {
     $jwtSettingsObject | Add-Member -MemberType NoteProperty -Name Jwt -Value ([pscustomobject]@{})
 }
 
-Set-ObjectProperty -Object $jwtSettingsObject.Jwt -Name "Authority" -Value "https://login.microsoftonline.com/$($TenantId.Trim())/v2.0"
-Set-ObjectProperty -Object $jwtSettingsObject.Jwt -Name "Audiences" -Value @("api://$($McpServerClientId.Trim())")
+Set-ObjectProperty -Object $jwtSettingsObject.Jwt -Name "Provider" -Value $IdentityProvider
+Set-ObjectProperty -Object $jwtSettingsObject.Jwt -Name "Authority" -Value $resolvedAuthority
+# When writing JWT settings, force arrays:
+Set-ObjectProperty -Object $jwtSettingsObject.Jwt -Name "ValidIssuers" -Value @($resolvedValidIssuers)
+Set-ObjectProperty -Object $jwtSettingsObject.Jwt -Name "Audiences" -Value @($resolvedMcpAudiences)
 Set-ObjectProperty -Object $jwtSettingsObject.Jwt -Name "RequiredScope" -Value $RequiredScope.Trim()
 
 if ($null -eq $oboSettingsObject) {
@@ -341,23 +504,49 @@ if ($null -eq $oboSettingsObject.Obo) {
     $oboSettingsObject | Add-Member -MemberType NoteProperty -Name Obo -Value ([pscustomobject]@{})
 }
 
-Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "ClientId" -Value $McpServerClientId.Trim()
+Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "ClientId" -Value $resolvedMcpClientId
 Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "ClientSecret" -Value $OboClientSecret
 Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "DownstreamApiBaseUrl" -Value $DownstreamApiBaseUrl.Trim()
 Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "DownstreamScope" -Value $DownstreamScope.Trim()
-
-if (-not [string]::IsNullOrWhiteSpace($DownstreamAudience)) {
-    Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "DownstreamAudience" -Value $DownstreamAudience.Trim()
-}
-
+Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "DownstreamAudience" -Value $DownstreamAudience.Trim()
+Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "TokenEndpoint" -Value $resolvedOboTokenEndpoint
+Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "GrantType" -Value $resolvedOboGrantType
 Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "WriteTokenTraceFile" -Value $writeTokenTraceFileResolved
 
 if (-not [string]::IsNullOrWhiteSpace($TokenTraceFilePath)) {
     Set-ObjectProperty -Object $oboSettingsObject.Obo -Name "TokenTraceFilePath" -Value $TokenTraceFilePath.Trim()
 }
 
-Set-Content -Path $jwtSettingsPath -Value ($jwtSettingsObject | ConvertTo-Json -Depth 10) -Encoding UTF8
-Set-Content -Path $oboSettingsPath -Value ($oboSettingsObject | ConvertTo-Json -Depth 10) -Encoding UTF8
+# BEFORE clearing/copying PhysicalPath
+$existingRuntimeJwtContent = $null
+$existingRuntimeOboContent = $null
+
+if (Test-Path $existingJwtPath) {
+    $existingRuntimeJwtContent = Get-Content -Path $existingJwtPath -Raw
+}
+if (Test-Path $existingOboPath) {
+    $existingRuntimeOboContent = Get-Content -Path $existingOboPath -Raw
+}
+
+if ((Test-Path $jwtSettingsPath) -and -not $OverwriteRuntimeConfig) {
+    Write-Host "==> Preserving existing jwtsettings.json (use -OverwriteRuntimeConfig to replace)." -ForegroundColor Yellow
+}
+elseif (-not $OverwriteRuntimeConfig -and -not [string]::IsNullOrWhiteSpace($existingRuntimeJwtContent)) {
+    Set-Content -Path $jwtSettingsPath -Value $existingRuntimeJwtContent -Encoding UTF8
+}
+else {
+    Set-Content -Path $jwtSettingsPath -Value ($jwtSettingsObject | ConvertTo-Json -Depth 10) -Encoding UTF8
+}
+
+if ((Test-Path $oboSettingsPath) -and -not $OverwriteRuntimeConfig) {
+    Write-Host "==> Preserving existing obosettings.json (use -OverwriteRuntimeConfig to replace)." -ForegroundColor Yellow
+}
+elseif (-not $OverwriteRuntimeConfig -and -not [string]::IsNullOrWhiteSpace($existingRuntimeOboContent)) {
+    Set-Content -Path $oboSettingsPath -Value $existingRuntimeOboContent -Encoding UTF8
+}
+else {
+    Set-Content -Path $oboSettingsPath -Value ($oboSettingsObject | ConvertTo-Json -Depth 10) -Encoding UTF8
+}
 
 if (-not $SkipHttpBinding) {
     $desiredHttpBinding = if ([string]::IsNullOrWhiteSpace($HostName)) {
@@ -391,7 +580,7 @@ elseif (-not $SkipHttpBinding) {
             New-WebBinding -Name $SiteName -Protocol http -Port $Port -IPAddress "*" | Out-Null
         }
         else {
-            New-WebBinding -Name $SiteName -Protocol http -Port $Port -IPAddress "*" -HostHeader $HostHeader | Out-Null
+            New-WebBinding -Name $SiteName -Protocol http -Port $Port -IPAddress "*" -HostHeader $HostName | Out-Null
         }
     }
 }
@@ -406,4 +595,5 @@ if ((Get-Website -Name $SiteName).State -ne "Started") {
 }
 
 Write-Host "Deployment complete."
+Write-Host "Identity provider: $IdentityProvider"
 

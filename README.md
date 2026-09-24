@@ -502,3 +502,97 @@ Disable tracing when done:
     "WriteTokenTraceFile": false
   }
 }
+
+## Troubleshooting: Let's Encrypt `403 unauthorized` during certificate request
+
+If `scripts\request-letsencrypt-certificate.ps1` is run without parameters, it uses placeholder defaults:
+
+- `SiteName = OAuthClientCredsTestSite`
+- `DnsName = example.contoso.xyz`
+
+That can create or reuse an invalid host-header binding and cause ACME validation to fail with errors like:
+
+- `Authorization result: invalid`
+- `acme:error:unauthorized`
+- `Invalid response ... /.well-known/acme-challenge/...: 403`
+
+### Fix
+
+1. Check current bindings:
+
+Import-Module WebAdministration
+Get-WebBinding -Name "OAuthClientCredsTestSite" | Select-Object Protocol, BindingInformation
+
+2. Remove placeholder binding if present:
+
+Remove-WebBinding -Name "OAuthClientCredsTestSite" -Protocol http -Port 80 -IPAddress "*" -HostHeader "example.contoso.xyz"
+
+3. Re-run with explicit values:
+
+.\request-letsencrypt-certificate.ps1 ` 
+  -SiteName "OAuthClientCredsTestSite" ` 
+  -DnsName "<your-real-dns-name>" ` 
+  -EmailAddress "<your-email>" ` 
+  -WacsExe "C:\Tools\win-acme\wacs.exe"
+
+### Required environment checks
+
+- `<your-real-dns-name>` resolves to this IIS server's public IP.
+- Inbound TCP port `80` is allowed.
+- No upstream proxy/WAF/CDN is blocking `/.well-known/acme-challenge/*`.
+
+## Copilot with Auth0/Okta protected MCP and downstream API
+
+This section documents end-to-end setup for:
+
+- Copilot -> connector/APIM (OAuth)
+- Connector/APIM -> MCP server protected by Auth0/Okta
+- MCP -> downstream protected app/API protected by Auth0/Okta (via OBO/token-exchange)
+
+### 1. Prerequisites
+
+Ensure these hosts are deployed and reachable over HTTPS:
+
+- MCP host: `https://oktatokenmcp.resurgemus.xyz`
+- Protected app/API host: `https://oktatokenapp.resurgemus.xyz` (audience identifier example: `OKTAAPP.Resurgemus.xyz`)
+
+Ensure MCP health endpoints respond:
+
+- `GET https://oktatokenmcp.resurgemus.xyz/api/status`
+- `GET https://oktatokenmcp.resurgemus.xyz/.well-known/mcp`
+
+### 2. Auth0 objects to create/verify
+
+1. **MCP API** (Auth0 → Applications → APIs)
+   - Identifier (audience): `https://oktatokenmcp.resurgemus.xyz`
+   - Permissions defined: `access_as_user`
+   - RBAC Settings: Enable RBAC = ON, Add Permissions in the Access Token = ON
+
+2. **Protected/downstream API** (Auth0 → Applications → APIs)
+   - Identifier (audience): `OKTAAPP.Resurgemus.xyz`
+   - Permissions defined: `api.read`, `api.write`, plus any endpoint-specific permissions (for example `competitor.read`)
+   - RBAC Settings: Enable RBAC = ON, Add Permissions in the Access Token = ON
+
+3. **Copilot/connector-facing application** (Auth0 → Applications → Applications)
+   - Type: Regular Web Application
+   - Allowed Callback URLs: include every redirect URI used by every client that signs in through this app (one per line)
+   - API Access tab → grant User-delegated Access to the MCP API's `access_as_user` permission
+   - Advanced Settings → Grant Types: confirm `Authorization Code` and `Refresh Token` are enabled
+
+4. **MCP confidential app** (used for downstream OBO/token exchange)
+   - Client ID/Secret used in `OUathMCPServer/obosettings.json`
+   - API Access tab → grant User-delegated Access to the protected API's permissions (`api.read`, plus any endpoint-specific permissions your policies check)
+
+5. **Roles** (Auth0 → User Management → Roles) — optional, only if you enforce role-based checks instead of/in addition to permission checks
+   - Create roles matching required role claims (for example `Api.Read`, `Competitor.Reader`)
+   - Map each role to the corresponding API permission(s)
+   - Assign roles to test users
+
+6. **Users** (Auth0 → User Management → Users)
+   - Assign roles and/or ensure the user's delegated grant includes the permissions needed for the endpoints being tested
+
+> Auth0 delegated tokens commonly emit granted permissions in a `permissions` claim as a JSON array string (for example `["api.read","competitor.read"]`), and may not emit a `roles` claim unless you add an Auth0 Action to inject one. Prefer permission-based authorization checks over role-only checks when using Auth0.
+
+### 3. MCP runtime configuration
+
+`C:\inetpub\wwwroot\OUathMCPServer\jwtsettings.json`:

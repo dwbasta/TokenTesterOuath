@@ -38,14 +38,15 @@ Write-Host "Current bindings:" -ForegroundColor Green
 Get-WebBinding -Name $SiteName |
 	Select-Object Protocol, BindingInformation
 
-Write-Host "Launching win-acme for IIS site ID $($site.Id)..." -ForegroundColor Cyan
+Write-Host "Launching win-acme for host $DnsName..." -ForegroundColor Cyan
 & $WacsExe `
-	--target iis `
-	--siteid $site.Id `
-	--installation iis `
-	--emailaddress $EmailAddress `
-	--accepttos `
-	--closeonfinish
+    --target iis `
+    --host $DnsName `
+    --installation iis `
+    --emailaddress $EmailAddress `
+    --accepttos `
+    --closeonfinish `
+    --verbose
 
 if ($LASTEXITCODE -ne 0) {
 	throw "win-acme failed with exit code $LASTEXITCODE."

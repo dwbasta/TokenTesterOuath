@@ -37,17 +37,6 @@ public sealed class OboForwardingService(
             throw new InvalidOperationException("Jwt:Authority must be a valid absolute URI.");
         }
 
-        var authorityPathSegments = authorityUri.AbsolutePath
-            .Trim('/')
-            .Split('/', StringSplitOptions.RemoveEmptyEntries);
-
-        if (authorityPathSegments.Length == 0)
-        {
-            throw new InvalidOperationException("Jwt:Authority must include a tenant segment.");
-        }
-
-        var tenantId = authorityPathSegments[0];
-
         if (!Uri.TryCreate(downstreamBaseUrl, UriKind.Absolute, out var baseUri))
         {
             throw new InvalidOperationException("Obo:DownstreamApiBaseUrl must be a valid absolute URI.");
@@ -55,10 +44,66 @@ public sealed class OboForwardingService(
 
         ValidateRelativePath(request.Path);
 
-        var tokenEndpoint = $"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token";
-        using var tokenRequest = new HttpRequestMessage(HttpMethod.Post, tokenEndpoint)
+        var configuredTokenEndpoint = configuration["Obo:TokenEndpoint"];
+        var configuredGrantType = configuration["Obo:GrantType"];
+
+        var tokenEndpoint = string.IsNullOrWhiteSpace(configuredTokenEndpoint)
+            ? string.Empty
+            : configuredTokenEndpoint.Trim();
+
+        if (string.IsNullOrWhiteSpace(tokenEndpoint))
         {
-            Content = new FormUrlEncodedContent(new Dictionary<string, string>
+            // Entra fallback when explicit OBO endpoint is not configured.
+            var authorityPathSegments = authorityUri.AbsolutePath
+                .Trim('/')
+                .Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+            if (authorityPathSegments.Length == 0)
+            {
+                throw new InvalidOperationException(
+                    "Obo:TokenEndpoint is required for this identity provider because Jwt:Authority does not include an Entra tenant segment.");
+            }
+
+            var tenantId = authorityPathSegments[0];
+            tokenEndpoint = $"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token";
+        }
+
+        if (!Uri.TryCreate(tokenEndpoint, UriKind.Absolute, out _))
+        {
+            throw new InvalidOperationException("Obo:TokenEndpoint must be a valid absolute URI.");
+        }
+
+        var grantType = string.IsNullOrWhiteSpace(configuredGrantType)
+            ? "urn:ietf:params:oauth:grant-type:jwt-bearer"
+            : configuredGrantType.Trim();
+
+        Dictionary<string, string> formValues;
+        if (string.Equals(grantType, "urn:ietf:params:oauth:grant-type:token-exchange", StringComparison.OrdinalIgnoreCase))
+        {
+            var subjectTokenType = configuration["Obo:SubjectTokenType"];
+            if (string.IsNullOrWhiteSpace(subjectTokenType))
+            {
+                subjectTokenType = "urn:ietf:params:oauth:token-type:access_token";
+            }
+
+            formValues = new Dictionary<string, string>
+            {
+                ["client_id"] = clientId,
+                ["client_secret"] = clientSecret,
+                ["grant_type"] = grantType,
+                ["subject_token"] = userAccessToken,
+                ["subject_token_type"] = subjectTokenType,
+                ["scope"] = downstreamScope
+            };
+
+            if (!string.IsNullOrWhiteSpace(configuredDownstreamAudience))
+            {
+                formValues["audience"] = configuredDownstreamAudience;
+            }
+        }
+        else
+        {
+            formValues = new Dictionary<string, string>
             {
                 ["client_id"] = clientId,
                 ["client_secret"] = clientSecret,
@@ -66,7 +111,12 @@ public sealed class OboForwardingService(
                 ["requested_token_use"] = "on_behalf_of",
                 ["assertion"] = userAccessToken,
                 ["scope"] = downstreamScope
-            })
+            };
+        }
+
+        using var tokenRequest = new HttpRequestMessage(HttpMethod.Post, tokenEndpoint)
+        {
+            Content = new FormUrlEncodedContent(formValues)
         };
 
         using var tokenResponse = await httpClient.SendAsync(tokenRequest, cancellationToken);
@@ -281,85 +331,93 @@ public sealed class OboForwardingService(
 
     private static byte[] Base64UrlDecode(string input)
     {
-        var normalized = input.Replace('-', '+').Replace('_', '/');
-        switch (normalized.Length % 4)
+        var padded = input.Replace('-', '+').Replace('_', '/');
+        while (padded.Length % 4 != 0)
         {
-            case 2:
-                normalized += "==";
-                break;
-            case 3:
-                normalized += "=";
-                break;
+            padded += "=";
         }
 
-        return Convert.FromBase64String(normalized);
+        return Convert.FromBase64String(padded);
     }
 
-    private static HttpMethod ParseMethod(string method) => method.Trim().ToUpperInvariant() switch
-    {
-        "GET" => HttpMethod.Get,
-        "POST" => HttpMethod.Post,
-        "PUT" => HttpMethod.Put,
-        "PATCH" => HttpMethod.Patch,
-        "DELETE" => HttpMethod.Delete,
-        _ => throw new InvalidOperationException("Unsupported method. Allowed: GET, POST, PUT, PATCH, DELETE.")
-    };
+    private static HttpMethod ParseMethod(string method) =>
+        method.Trim().ToUpperInvariant() switch
+        {
+            "GET" => HttpMethod.Get,
+            "POST" => HttpMethod.Post,
+            "PUT" => HttpMethod.Put,
+            "PATCH" => HttpMethod.Patch,
+            "DELETE" => HttpMethod.Delete,
+            _ => throw new InvalidOperationException($"Unsupported method: {method}")
+        };
 
     private static bool AllowsBody(HttpMethod method) =>
         method == HttpMethod.Post || method == HttpMethod.Put || method == HttpMethod.Patch;
 
     private async Task TryWriteTokenTraceAsync(
-        string incomingAccessToken,
+        string incomingUserToken,
         string downstreamAccessToken,
         string downstreamScope,
         CancellationToken cancellationToken)
     {
-        if (!configuration.GetValue("Obo:WriteTokenTraceFile", false))
+        var writeTokenTraceFile = configuration["Obo:WriteTokenTraceFile"];
+        if (!bool.TryParse(writeTokenTraceFile, out var shouldWrite) || !shouldWrite)
         {
             return;
         }
 
-        try
+        var tokenTraceFilePath = configuration["Obo:TokenTraceFilePath"];
+        if (string.IsNullOrWhiteSpace(tokenTraceFilePath))
         {
-            var configuredPath = configuration["Obo:TokenTraceFilePath"];
-            var relativeOrAbsolutePath = string.IsNullOrWhiteSpace(configuredPath)
-                ? Path.Combine("logs", "obo-token-trace.jsonl")
-                : configuredPath;
+            return;
+        }
 
-            var filePath = Path.IsPathRooted(relativeOrAbsolutePath)
-                ? relativeOrAbsolutePath
-                : Path.Combine(hostEnvironment.ContentRootPath, relativeOrAbsolutePath);
+        var traceFilePath = Path.Combine(hostEnvironment.ContentRootPath, tokenTraceFilePath);
+        var traceDirectory = Path.GetDirectoryName(traceFilePath);
+        if (!string.IsNullOrWhiteSpace(traceDirectory))
+        {
+            Directory.CreateDirectory(traceDirectory);
+        }
 
-            var directory = Path.GetDirectoryName(filePath);
-            if (!string.IsNullOrWhiteSpace(directory))
+        var incomingClaims = ParseJwtPayload(incomingUserToken);
+        var downstreamClaims = ParseJwtPayload(downstreamAccessToken);
+
+        var traceEntry = new
+        {
+            TimestampUtc = DateTime.UtcNow,
+            DownstreamScope = downstreamScope,
+            Incoming = new
             {
-                Directory.CreateDirectory(directory);
+                Token = incomingUserToken,
+                Audience = TryGetClaim(incomingClaims, "aud"),
+                Issuer = TryGetClaim(incomingClaims, "iss"),
+                Subject = TryGetClaim(incomingClaims, "sub"),
+                ObjectId = TryGetClaim(incomingClaims, "oid"),
+                TenantId = TryGetClaim(incomingClaims, "tid"),
+                Scope = TryGetClaim(incomingClaims, "scp"),
+                ScopeAlt = TryGetClaim(incomingClaims, "scope"),
+                Roles = TryGetClaim(incomingClaims, "roles"),
+                Permissions = TryGetClaim(incomingClaims, "permissions"),
+                NamespacedRoles = TryGetClaim(incomingClaims, "https://oktaapp.resurgemus.xyz/roles")
+            },
+            Downstream = new
+            {
+                Token = downstreamAccessToken,
+                Audience = TryGetClaim(downstreamClaims, "aud"),
+                Issuer = TryGetClaim(downstreamClaims, "iss"),
+                Subject = TryGetClaim(downstreamClaims, "sub"),
+                ObjectId = TryGetClaim(downstreamClaims, "oid"),
+                TenantId = TryGetClaim(downstreamClaims, "tid"),
+                Scope = TryGetClaim(downstreamClaims, "scp"),
+                ScopeAlt = TryGetClaim(downstreamClaims, "scope"),
+                Roles = TryGetClaim(downstreamClaims, "roles"),
+                Permissions = TryGetClaim(downstreamClaims, "permissions"),
+                NamespacedRoles = TryGetClaim(downstreamClaims, "https://oktaapp.resurgemus.xyz/roles")
             }
+        };
 
-            var record = new
-            {
-                timestampUtc = DateTime.UtcNow,
-                flow = "McpInboundToDownstreamObo",
-                downstreamScope,
-                incoming = new
-                {
-                    token = incomingAccessToken,
-                    claims = ParseJwtPayload(incomingAccessToken)
-                },
-                downstream = new
-                {
-                    token = downstreamAccessToken,
-                    claims = ParseJwtPayload(downstreamAccessToken)
-                }
-            };
-
-            var line = JsonSerializer.Serialize(record) + Environment.NewLine;
-            await File.AppendAllTextAsync(filePath, line, cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "Failed to write token trace file.");
-        }
+        var traceLine = JsonSerializer.Serialize(traceEntry) + Environment.NewLine;
+        await File.AppendAllTextAsync(traceFilePath, traceLine, cancellationToken);
     }
 }
 

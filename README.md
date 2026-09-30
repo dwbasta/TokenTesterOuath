@@ -575,7 +575,9 @@ Ensure MCP health endpoints respond:
 
 3. **Copilot/connector-facing application** (Auth0 → Applications → Applications)
    - Type: Regular Web Application
-   - Allowed Callback URLs: include every redirect URI used by every client that signs in through this app (one per line)
+   - Allowed Callback URLs: include every redirect URI used by every client that signs in through this app (one per line), for example:
+     - `https://oauth.usebruno.com/callback`
+     - `https://global.consent.azure-apim.net/redirect/<your-connector-redirect-id>`
    - API Access tab → grant User-delegated Access to the MCP API's `access_as_user` permission
    - Advanced Settings → Grant Types: confirm `Authorization Code` and `Refresh Token` are enabled
 
@@ -596,3 +598,115 @@ Ensure MCP health endpoints respond:
 ### 3. MCP runtime configuration
 
 `C:\inetpub\wwwroot\OUathMCPServer\jwtsettings.json`:
+
+​```json
+{
+  "Jwt": {
+    "Provider": "Okta",
+    "Authority": "https://dev-resurgemus.us.auth0.com",
+    "ValidIssuers": [
+      "https://dev-resurgemus.us.auth0.com",
+      "https://dev-resurgemus.us.auth0.com/"
+    ],
+    "Audiences": [
+      "https://oktatokenmcp.resurgemus.xyz"
+    ],
+    "RequiredRole": "Mcp.Invoke",
+    "RequiredScope": "access_as_user",
+    "RoleClaimType": "roles",
+    "NameClaimType": "sub"
+  }
+}
+​```
+
+`C:\inetpub\wwwroot\OUathMCPServer\obosettings.json`:
+
+​```json
+{
+  "Obo": {
+    "ClientId": "<mcp-confidential-client-id>",
+    "ClientSecret": "<mcp-confidential-client-secret>",
+    "DownstreamApiBaseUrl": "https://oktatokenapp.resurgemus.xyz/",
+    "DownstreamScope": "access_as_user",
+    "DownstreamAudience": "OKTAAPP.Resurgemus.xyz",
+    "TokenEndpoint": "https://dev-resurgemus.us.auth0.com/oauth/token",
+    "GrantType": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    "WriteTokenTraceFile": false,
+    "TokenTraceFilePath": "logs/obo-token-trace.jsonl"
+  }
+}
+​```
+
+> `GrantType` and `TokenEndpoint` are required here for Auth0. If omitted, the app falls back to an Entra-style token endpoint, which does not exist for Auth0 tenants. On every redeploy, pass `-OboGrantType` and `-OboTokenEndpoint` explicitly to `deploy-mcp-iis-vm.ps1` so these values are not silently dropped or reset.
+>
+> Auth0's `urn:ietf:params:oauth:grant-type:token-exchange` grant type requires additional tenant-level configuration and a supported `subject_token_type`; using an unsupported value returns `Invalid subject_token_type`. Prefer `urn:ietf:params:oauth:grant-type:jwt-bearer` unless you have explicitly configured and validated Auth0 token exchange for your tenant.
+
+MCP OAuth discovery endpoints (`/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource`, `/.well-known/openid-configuration`) are provider-aware based on `Jwt:Provider`. When `Jwt:Provider` is `Okta` or `Auth0`, these endpoints correctly advertise the Auth0 tenant's `/authorize`, `/oauth/token`, and JWKS URLs. Without this, discovery falls back to a hardcoded Microsoft Entra endpoint shape, which is incorrect for Auth0 tenants and can cause MCP-aware clients to attempt authorization against the wrong identity provider entirely.
+
+### 4. Protected/downstream app runtime configuration
+
+`C:\inetpub\wwwroot\OAuthClientCredsTestSite\jwtsettings.json`:
+
+````````
+{
+  "Jwt": {
+    "Authority": "https://login.microsoftonline.com/<tenant-id>/v2.0",
+    "Audiences": [
+      "api://<protected-api-app-id>"
+    ],
+
+````````
+
+Both `jwtsettings.json` files must have valid, non-empty `Jwt:Authority` and `Jwt:Audiences` — an incomplete/empty file causes the app to crash on startup (`500.30`, `InvalidOperationException: JWT configuration is incomplete`).
+
+Endpoint authorization checks should be permission-aware, not role-only, since Auth0 delegated tokens commonly carry a `permissions` claim (JSON array string) rather than a `roles` claim:
+
+````````
+`HasScopeOrPermission(...)` must parse claim values that may be JSON array strings (for example `["api.read","competitor.read"]`), not only space-delimited strings, or permission checks will silently fail even when the token carries the correct grant.
+
+### 5. Microsoft 365 Copilot / Power Platform custom connector configuration
+
+[TODO: confirm and document the exact working configuration — see notes below]
+
+The path that ultimately resolved token audience/authentication issues combined:
+
+1. A working custom connector `apiProperties.json` using `identityProvider: "oauth2generic"` with explicit `customParameters` (`AuthorizationUrl`, `TokenUrl`, `RefreshUrl`) plus `AuthorizationUrlTemplate` and `AuthorizationUrlQueryStringTemplate` to inject the MCP API audience into the authorization request, downloaded/updated via `pac connector download` / `pac connector update`.
+2. Re-verifying the client secret directly in the Power Apps portal's connector **Security** tab after every `pac connector update` — the Power Platform CLI does not round-trip the client secret through `apiProperties.json`, and a stale/missing secret produces a generic `Unauthorized` token-exchange failure (Auth0 log event type `feacft`) that looks identical to an audience/scope misconfiguration.
+3. [Add specific detail from Microsoft Learn plugin authentication OAuth guidance once confirmed — for example, whether this ultimately required an `ai-plugin.json` manifest `auth` block instead of/alongside the custom connector `apiProperties.json`.]
+
+Reference `apiProperties.json` `customParameters` block:
+
+````````
+
+### 8. Common failures
+
+- `401 Unauthorized` from MCP or app
+  - Authority/issuer mismatch
+  - Audience mismatch
+  - `Audiences` written as scalar instead of JSON array
+
+- `403 Forbidden` from MCP (no OBO trace entry written)
+  - Incoming token missing required role/scope for the MCP API audience
+  - `McpInvoke` policy or JWT bearer configuration missing/misconfigured in `OUathMCPServer/Program.cs`
+  - Token is a JWE, not a signed JWT — check for `SecurityTokenDecryptionFailedException` in stdout logs, which means the connector requested the wrong (default/userinfo) audience during authorization
+
+- `403 Forbidden` from downstream API (OBO trace entry present)
+  - Downstream token validates, but required scope/role/permission missing for that specific endpoint
+  - Auth0 `permissions` claim arrives as a JSON array string; ensure claim parsing handles that shape, not just space-delimited strings
+  - Confirm both the OBO client and the signed-in user are granted the specific permission for that endpoint (both must be granted; either one missing causes a `403`)
+
+- `Callback URL mismatch` during sign-in
+  - The client's `redirect_uri` is not listed (exact match) in the Auth0 application's Allowed Callback URLs
+  - Multiple redirect URIs (for example Bruno and a Power Platform connector) can coexist in the same list
+
+- `access_denied` / `Unauthorized` during token exchange (Auth0 log event type `feacft`)
+  - Check Auth0 Monitoring → Logs `description` field for the exact reason
+  - A generic `Unauthorized` with no further detail is commonly caused by a missing/stale client secret — always re-verify the client secret in the Power Apps portal's connector Security tab after any `pac connector update`, since the CLI does not round-trip secrets through `apiProperties.json`
+  - `Invalid subject_token_type` specifically indicates `Obo:GrantType` is set to `urn:ietf:params:oauth:grant-type:token-exchange` without valid tenant/API support; switch to `urn:ietf:params:oauth:grant-type:jwt-bearer`
+
+- `Missing required parameter: client_id` during authorization
+  - A custom `authorizationUrl` with a hand-appended query string (for example `?audience=...`) can be corrupted if the connector platform appends its own parameters using `?` instead of `&`. Do not hand-edit `authorizationUrl` with a static query string in Swagger `securityDefinitions`; use the connector's supported template mechanism instead (see section 5)
+
+- `500.30 app failed to start`
+  - Invalid, empty, or malformed runtime `jwtsettings.json`/`obosettings.json`
+  - Confirm `Jwt:Authority` and `Jwt:Audiences` are present and correctly shaped in both apps' deployed config files

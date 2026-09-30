@@ -177,7 +177,8 @@ public sealed class McpDiscoveryController(
         var metadata = GetAuthorityMetadataSafe();
         var requiredScope = configuration["Jwt:RequiredScope"] ?? "access_as_user";
         var audiences = configuration.GetSection("Jwt:Audiences").Get<string[]>() ?? Array.Empty<string>();
-        var resource = audiences.FirstOrDefault() ?? $"{Request.Scheme}://{Request.Host}";
+        var resource = audiences.FirstOrDefault(a => !string.IsNullOrWhiteSpace(a))
+            ?? $"{Request.Scheme}://{Request.Host}";
 
         return new
         {
@@ -224,6 +225,23 @@ public sealed class McpDiscoveryController(
     private AuthorityMetadata GetAuthorityMetadataSafe()
     {
         var authority = configuration["Jwt:Authority"] ?? string.Empty;
+        var provider = configuration["Jwt:Provider"] ?? string.Empty;
+
+        if (string.Equals(provider, "Okta", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(provider, "Auth0", StringComparison.OrdinalIgnoreCase))
+        {
+            var normalizedAuthority = authority.TrimEnd('/');
+            if (!string.IsNullOrWhiteSpace(normalizedAuthority) &&
+                Uri.TryCreate(normalizedAuthority, UriKind.Absolute, out _))
+            {
+                return new AuthorityMetadata(
+                    normalizedAuthority,
+                    $"{normalizedAuthority}/authorize",
+                    $"{normalizedAuthority}/oauth/token",
+                    $"{normalizedAuthority}/.well-known/jwks.json");
+            }
+        }
+
         if (Uri.TryCreate(authority, UriKind.Absolute, out var authorityUri))
         {
             var segments = authorityUri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
